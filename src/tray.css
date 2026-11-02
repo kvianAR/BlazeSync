@@ -1,0 +1,239 @@
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+  background: #181d28;
+  color: #e8edf7;
+  font:
+    12px -apple-system,
+    BlinkMacSystemFont,
+    sans-serif;
+}
+.panel {
+  padding: 22px;
+}
+button {
+  font: inherit;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  color: #a9b5cb;
+  background: transparent;
+  border: 0;
+  border-radius: 7px;
+  padding: 8px;
+}
+button:hover {
+  background: #ffffff0b;
+}
+button:focus-visible {
+  outline: 2px solid #7299ff;
+}
+header {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+}
+header img {
+  width: 39px;
+  height: 39px;
+}
+header strong {
+  font-size: 18px;
+  letter-spacing: -0.5px;
+}
+small {
+  display: block;
+  font-size: 10px;
+  color: #8592aa;
+  line-height: 1.5;
+}
+header small {
+  font-size: 10px;
+  margin-top: 4px;
+}
+header button {
+  margin-left: auto;
+}
+.connection {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 10px;
+  color: #8f9db5;
+  margin-top: 23px;
+}
+.connection span {
+  width: 6px;
+  height: 6px;
+  background: #7f899a;
+  border-radius: 50%;
+}
+.connection .online {
+  background: #60c69f;
+}
+.summary {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 13px;
+  margin-top: 17px;
+}
+.summary > div {
+  position: relative;
+  background: #202736;
+  border: 1px solid #2d3546;
+  border-radius: 9px;
+  padding: 14px;
+}
+.summary svg {
+  position: absolute;
+  right: 13px;
+  top: 15px;
+  color: #8398bf;
+}
+.summary b {
+  display: block;
+  font-size: 25px;
+  font-weight: 550;
+}
+.summary small {
+  margin-top: 6px;
+  font-size: 9px;
+}
+nav {
+  display: flex;
+  gap: 8px;
+  margin-top: 17px;
+}
+nav button {
+  flex: 1;
+  background: #242c3c;
+  font-size: 10px;
+  padding: 10px 6px;
+}
+section {
+  height: 183px;
+  overflow: hidden;
+  margin-top: 24px;
+}
+h3 {
+  font-size: 8px;
+  letter-spacing: 1.7px;
+  color: #7787a5;
+  font-weight: 500;
+  margin: 0 0 12px;
+}
+.recent {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 0;
+}
+.recent > svg {
+  color: #708bb8;
+  flex-shrink: 0;
+}
+.recent div {
+  min-width: 0;
+  flex: 1;
+}
+.recent b {
+  display: block;
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-weight: 500;
+}
+.recent small {
+  font-size: 9px;
+  margin-top: 4px;
+}
+.recent .green {
+  color: #67bd9d;
+}
+.no-transfers {
+  text-align: center;
+  padding: 23px 0;
+  color: #6c819e;
+}
+.no-transfers p {
+  font-size: 12px;
+  color: #a8b6cd;
+  margin: 12px 0 7px;
+}
+.no-transfers small {
+  font-size: 9px;
+}
+.open-app {
+  width: 100%;
+  background: #3269ed;
+  color: white;
+  font-size: 12px;
+  font-weight: 550;
+  padding: 12px;
+}
+.open-app:hover {
+  background: #4278ff;
+}
+footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid #2b3241;
+  font-size: 8px;
+  color: #77859f;
+}
+footer button {
+  font-size: 9px;
+  padding: 5px;
+  color: #a4aec0;
+}
+.drop-hint {
+  font-size: 9px;
+  color: #8fa3c7;
+  margin-bottom: 13px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.dragging {
+  outline: 2px dashed #8baaff;
+  outline-offset: -5px;
+  background: #253755;
+}
+.drop-error {
+  font-size: 10px;
+  color: #f7b4aa;
+}
+.panel section {
+  height: 157px;
+}
+nav button {
+  font-size: 9px;
+  gap: 4px;
+  padding-inline: 4px;
+}
+nav {
+  gap: 5px;
+}
+:root[data-theme="light"] body {
+  background: #f5f7fc;
+  color: #27344c;
+}
+:root[data-theme="light"] .summary > div,
+:root[data-theme="light"] nav button {
+  background: #e7edf8;
+  border-color: #d4dded;
+}
+:root[data-theme="light"] header strong {
+  color: #27344c;
+}
+:root[data-theme="light"] .recent b {
+  color: #34415a;
+}
