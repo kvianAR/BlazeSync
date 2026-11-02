@@ -1,0 +1,1330 @@
+const {
+  app,
+  BrowserWindow,
+  ipcMain,
+  dialog,
+  safeStorage,
+  clipboard,
+  Tray,
+  Menu,
+  nativeImage,
+  screen,
+  powerMonitor,
+  shell,
+  nativeTheme,
+} = require("electron");
+const fs = require("node:fs");
+const fsp = fs.promises;
+const path = require("node:path");
+const { pipeline } = require("node:stream/promises");
+const {
+  S3Client,
+  ListBucketsCommand,
+  ListObjectsV2Command,
+  GetObjectCommand,
+  HeadObjectCommand,
+  DeleteObjectCommand,
+  ListObjectVersionsCommand,
+  CopyObjectCommand,
+  PutObjectCommand,
+} = require("@aws-sdk/client-s3");
+const { NodeHttpHandler } = require("@smithy/node-http-handler");
+const { createHash } = require("node:crypto");
+const { Upload } = require("@aws-sdk/lib-storage");
+const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
+const {
+  validateConnection,
+  joinKey,
+  copySource,
+  backupKey,
+  due,
+  isPhoto,
+  canPreview,
+} = require("./helpers.cjs");
+const { discoverConnection, healthFromError } = require("./connection.cjs");
+let health = "checking",
+  checkingConnection = false,
+  pendingSavedSecret = null;
+let win,
+  tray,
+  trayWindow,
+  isQuitting = false,
+  client,
+  connection,
+  transfers = [],
+  jobs = [],
+  events = [],
+  active = new Map();
+const {
+  uploadEntries,
+  safeDownloadPath,
+  updateProgress,
+  deleteError,
+  cancelled,
+} = require("./files.cjs");
+const { FolderMetrics } = require("./folder-metrics.cjs");
+const folderMetrics = new FolderMetrics();
+function connectionId() {
+  return connection
+    ? createHash("sha256")
+        .update(connection.endpoint + "|" + connection.keyId)
+        .digest("hex")
+        .slice(0, 24)
+    : null;
+}
+let uploadTail = Promise.resolve(),
+  downloadTail = Promise.resolve(),
+  revision = 0,
+  connectionEditing = false;
+let preferences = { theme: "dark", uploadTarget: null, refreshSeconds: 15 };
+const preferencesPath = () =>
+  path.join(app.getPath("userData"), "preferences.json");
+function savePreferences() {
+  fs.writeFileSync(preferencesPath(), JSON.stringify(preferences), {
+    mode: 0o600,
+  });
+}
+function cloudChanged() {
+  folderMetrics.invalidate();
+  revision++;
+  emit();
+}
+let progressTimer;
+function progressEmit() {
+  if (isQuitting) return;
+  if (!progressTimer)
+    progressTimer = setTimeout(() => {
+      progressTimer = null;
+      emit();
+    }, 200);
+}
+function dropError(error) {
+  log(error.message);
+  showMain("files");
+  win.webContents.send("vault:error", error.message);
+}
+async function dropOnTray(paths) {
+  try {
+    const target = preferences.uploadTarget;
+    if (!client) throw new Error("Connect Backblaze B2 before dropping files.");
+    if (
+      !target ||
+      target.endpoint !== connection.endpoint ||
+      target.keyId !== connection.keyId
+    )
+      throw new Error(
+        "Open a bucket or folder in BlazeSync first to choose the upload destination.",
+      );
+    await queuePaths(target.bucket, target.prefix, paths);
+  } catch (error) {
+    dropError(error);
+  }
+}
+
+const {
+  historyPage,
+  exactVersions,
+  purgeVersions,
+} = require("./cloud-history.cjs");
+const statePath = () => path.join(app.getPath("userData"), "vault.json");
+function persist(savedConnection = connection) {
+  if (!safeStorage.isEncryptionAvailable())
+    throw new Error("macOS protected credential storage is unavailable.");
+  const preservePending = arguments.length === 0 ? pendingSavedSecret : null;
+  const temporary = statePath() + ".tmp";
+  fs.writeFileSync(
+    temporary,
+    JSON.stringify({
+      secret: savedConnection
+        ? safeStorage
+            .encryptString(JSON.stringify(savedConnection))
+            .toString("base64")
+        : preservePending || null,
+      jobs: jobs.map(({ running, ...j }) => j),
+    }),
+    { mode: 0o600 },
+  );
+  fs.renameSync(temporary, statePath());
+}
+function publicState() {
+  return {
+    connected: !!client,
+    connectionId: connectionId(),
+    health,
+    revision,
+    refreshSeconds: preferences.refreshSeconds ?? 15,
+    connectionEditing,
+    theme: preferences.theme,
+    dark:
+      preferences.theme === "dark" ||
+      (preferences.theme === "system" && nativeTheme.shouldUseDarkColors),
+    uploadTarget:
+      preferences.uploadTarget &&
+      connection &&
+      preferences.uploadTarget.endpoint === connection.endpoint &&
+      preferences.uploadTarget.keyId === connection.keyId
+        ? {
+            bucket: preferences.uploadTarget.bucket,
+            prefix: preferences.uploadTarget.prefix,
+          }
+        : null,
+    connection: connection
+      ? {
+          endpoint: connection.endpoint,
+          region: connection.region,
+          bucket: connection.bucket,
+          buckets: connection.buckets || [],
+          keyId: connection.keyId.slice(0, 5) + "••••",
+        }
+      : null,
+    transfers,
+    jobs: jobs.map(({ keyId, endpoint, ...job }) => job),
+    events,
+  };
+}
+function emit() {
+  if (isQuitting) return;
+  for (const w of [win, trayWindow])
+    if (w && !w.isDestroyed())
+      w.webContents.send("vault:update", publicState());
+  if (tray && !tray.isDestroyed())
+    tray.setToolTip(
+      "BlazeSync · " +
+        transfers.filter((t) => ["queued", "running"].includes(t.status))
+          .length +
+        " active transfers",
+    );
+}
+function log(message) {
+  events.unshift({ id: crypto.randomUUID(), at: Date.now(), message });
+  events = events.slice(0, 100);
+  emit();
+}
+function getClient() {
+  if (!client) throw new Error("Connect your Backblaze B2 account first.");
+  return client;
+}
+function setHealth(next) {
+  if (health !== next) {
+    health = next;
+    emit();
+  }
+}
+function makeClient(c) {
+  const sdk = new S3Client({
+    requestHandler: new NodeHttpHandler({
+      connectionTimeout: 10000,
+      socketTimeout: 60000,
+    }),
+    endpoint: c.endpoint,
+    region: c.region,
+    credentials: { accessKeyId: c.keyId, secretAccessKey: c.applicationKey },
+    requestChecksumCalculation: "WHEN_REQUIRED",
+    responseChecksumValidation: "WHEN_REQUIRED",
+    retryMode: "standard",
+    maxAttempts: 5,
+  });
+  sdk.middlewareStack.add(
+    (next) => async (args) => {
+      try {
+        const result = await next(args);
+        if (client === sdk) setHealth("online");
+        return result;
+      } catch (error) {
+        if (client === sdk) {
+          const status = healthFromError(error);
+          if (status) setHealth(status);
+        }
+        throw error;
+      }
+    },
+    { step: "initialize", name: "blazeConnectionHealth" },
+  );
+  return sdk;
+}
+async function connectionBuckets(c = connection, s3 = client) {
+  if (c.buckets?.length) return c.buckets.map((Name) => ({ Name }));
+  if (c.bucket) return [{ Name: c.bucket }];
+  return (await s3.send(new ListBucketsCommand({}))).Buckets || [];
+}
+function restoreSavedConnection() {
+  if (!pendingSavedSecret || client) return;
+  try {
+    const restored = JSON.parse(
+      safeStorage.decryptString(Buffer.from(pendingSavedSecret, "base64")),
+    );
+    validateConnection(restored);
+    connection = restored;
+    client = makeClient(restored);
+    pendingSavedSecret = null;
+    setHealth("checking");
+  } catch {
+    setHealth("locked");
+  }
+}
+async function checkConnection() {
+  restoreSavedConnection();
+  if (!client || checkingConnection) return;
+  checkingConnection = true;
+  const current = client;
+  try {
+    const buckets = await connectionBuckets();
+    if (buckets[0])
+      await current.send(
+        new ListObjectsV2Command({ Bucket: buckets[0].Name, MaxKeys: 1 }),
+      );
+    if (client === current) setHealth("online");
+  } catch (error) {
+    if (client === current) setHealth(healthFromError(error) || "attention");
+  } finally {
+    checkingConnection = false;
+  }
+}
+function transfer(type, bucket, key, size = 0) {
+  const t = {
+    id: crypto.randomUUID(),
+    type,
+    bucket,
+    key,
+    size,
+    loaded: 0,
+    status: "queued",
+    at: Date.now(),
+  };
+  transfers.unshift(t);
+  if (transfers.length > 300)
+    transfers = transfers
+      .filter((x) => !["done", "failed", "cancelled"].includes(x.status))
+      .concat(
+        transfers
+          .filter((x) => ["done", "failed", "cancelled"].includes(x.status))
+          .slice(0, 200),
+      );
+  emit();
+  return t;
+}
+function fail(t, e) {
+  t.status =
+    e.name === "AbortError" || t.status === "cancelled"
+      ? "cancelled"
+      : "failed";
+  t.speed = 0;
+  t.eta = null;
+  t.error = t.status === "failed" ? e.message : undefined;
+  emit();
+}
+async function uploadFile(bucket, key, file, directory = false, size = 0) {
+  const t = transfer("upload", bucket, key, size);
+  t.directory = directory;
+  const result = uploadTail.then(async () => {
+    let uploader;
+    try {
+      if (t.status === "cancelled") throw cancelled();
+      const c = getClient(),
+        stat = directory ? { size: 0, mtimeMs: 0 } : await fsp.stat(file);
+      t.size = stat.size;
+      t.status = "running";
+      t.startedAt = Date.now();
+      emit();
+      if (directory) {
+        const abort = new AbortController();
+        active.set(t.id, () => abort.abort());
+        await c.send(
+          new PutObjectCommand({ Bucket: bucket, Key: key, Body: "" }),
+          { abortSignal: abort.signal },
+        );
+      } else {
+        uploader = new Upload({
+          client: c,
+          params: {
+            Bucket: bucket,
+            Key: key,
+            Body: fs.createReadStream(file),
+            ContentLength: stat.size,
+            Metadata: { "vault-mtime": String(Math.trunc(stat.mtimeMs)) },
+          },
+          queueSize: 3,
+          partSize: 8 * 1024 * 1024,
+          leavePartsOnError: false,
+        });
+        active.set(t.id, () => uploader.abort());
+        uploader.on("httpUploadProgress", (p) => {
+          updateProgress(t, p.loaded || 0);
+          progressEmit();
+        });
+        await uploader.done();
+        const head = await c.send(
+          new HeadObjectCommand({ Bucket: bucket, Key: key }),
+        );
+        if (head.ContentLength !== stat.size)
+          throw new Error("Upload size verification failed");
+        const after = await fsp.stat(file);
+        if (after.size !== stat.size || after.mtimeMs !== stat.mtimeMs)
+          throw new Error(
+            "Local file changed during upload. Retry after the file stops changing.",
+          );
+      }
+      if (t.status === "cancelled") throw cancelled();
+      t.status = "done";
+      t.loaded = t.size;
+      t.speed = 0;
+      t.eta = 0;
+      cloudChanged();
+    } catch (error) {
+      fail(t, error);
+      throw error;
+    } finally {
+      active.delete(t.id);
+    }
+  });
+  uploadTail = result.catch(() => {});
+  return result;
+}
+async function queuePaths(bucket, prefix, paths) {
+  getClient();
+  if (!bucket) throw new Error("Select an upload bucket first.");
+  let count = 0;
+  for await (const entry of uploadEntries(paths, prefix)) {
+    uploadFile(
+      bucket,
+      entry.key,
+      entry.file,
+      entry.directory,
+      entry.size,
+    ).catch(() => {});
+    if (!entry.directory) count++;
+  }
+  log("Queued " + count + " file(s) for " + bucket + "/" + prefix);
+  return { files: count };
+}
+async function downloadToFile(bucket, key, destination, group = "") {
+  const c = getClient(),
+    t = transfer("download", bucket, key);
+  t.group = group;
+  const result = downloadTail.then(async () => {
+    const abort = new AbortController();
+    const temporary = destination + ".vault-" + t.id + ".part";
+    try {
+      if (t.status === "cancelled") throw cancelled();
+      active.set(t.id, () => abort.abort());
+      t.status = "running";
+      t.startedAt = Date.now();
+      emit();
+      await fsp.mkdir(path.dirname(destination), { recursive: true });
+      const object = await c.send(
+        new GetObjectCommand({ Bucket: bucket, Key: key }),
+        { abortSignal: abort.signal },
+      );
+      t.size = object.ContentLength || 0;
+      object.Body.on("data", (chunk) => {
+        updateProgress(t, t.loaded + chunk.length);
+        progressEmit();
+      });
+      await pipeline(
+        object.Body,
+        fs.createWriteStream(temporary, { flags: "wx" }),
+        { signal: abort.signal },
+      );
+      if (t.loaded !== t.size)
+        throw new Error("Download size verification failed");
+      if (group) {
+        await fsp.copyFile(temporary, destination, fs.constants.COPYFILE_EXCL);
+        await fsp.rm(temporary);
+      } else await fsp.rename(temporary, destination);
+      t.status = "done";
+      t.speed = 0;
+      t.eta = 0;
+      emit();
+    } catch (error) {
+      await fsp.rm(temporary, { force: true }).catch(() => {});
+      fail(t, error);
+      throw error;
+    } finally {
+      active.delete(t.id);
+    }
+  });
+  downloadTail = result.catch(() => {});
+  return result;
+}
+async function listTree(bucket, prefix) {
+  const objects = [];
+  let token;
+  const seenTokens = new Set();
+  do {
+    const result = await getClient().send(
+      new ListObjectsV2Command({
+        Bucket: bucket,
+        Prefix: prefix,
+        MaxKeys: 1000,
+        ContinuationToken: token,
+      }),
+    );
+    objects.push(...(result.Contents || []));
+    token = result.NextContinuationToken;
+    if (result.IsTruncated && !token)
+      throw new Error(
+        "Cloud folder listing is incomplete. Refresh and try again.",
+      );
+    if (token) {
+      if (seenTokens.has(token))
+        throw new Error("Backblaze repeated a folder page.");
+      seenTokens.add(token);
+    }
+  } while (token);
+  return objects;
+}
+function blockBusyDelete(bucket, prefix, folder = false) {
+  if (
+    transfers.some(
+      (t) =>
+        t.type === "upload" &&
+        t.bucket === bucket &&
+        ["queued", "running"].includes(t.status) &&
+        (folder ? t.key.startsWith(prefix) : t.key === prefix),
+    )
+  )
+    throw new Error(
+      "An upload is still writing here. Finish or cancel it before deleting.",
+    );
+}
+async function deleteKey(bucket, key) {
+  try {
+    await getClient().send(
+      new DeleteObjectCommand({ Bucket: bucket, Key: key }),
+    );
+  } catch (error) {
+    throw deleteError(error);
+  }
+}
+async function* walk(root) {
+  for (const e of await fsp.readdir(root, { withFileTypes: true })) {
+    if (e.name === ".DS_Store") continue;
+    const p = path.join(root, e.name);
+    if (e.isDirectory()) yield* walk(p);
+    else if (e.isFile()) yield p;
+  }
+}
+async function runBackup(id) {
+  const j = jobs.find((j) => j.id === id);
+  if (!j || j.running) return;
+  if (!client) throw new Error("Connect your B2 account first.");
+  if (j.endpoint !== connection.endpoint || j.keyId !== connection.keyId)
+    throw new Error(
+      "This backup belongs to another connection. Reconnect its original B2 key.",
+    );
+  j.running = true;
+  j.lastAttempt = Date.now();
+  j.error = null;
+  let count = 0,
+    skipped = 0;
+  try {
+    persist();
+    emit();
+    for await (const file of walk(j.folder)) {
+      if (!j.running) break;
+      const stat = await fsp.stat(file),
+        key = backupKey(j.prefix, j.folder, file);
+      let h;
+      try {
+        h = await getClient().send(
+          new HeadObjectCommand({ Bucket: j.bucket, Key: key }),
+        );
+      } catch (e) {
+        if (e.$metadata?.httpStatusCode !== 404) throw e;
+      }
+      if (
+        h &&
+        h.ContentLength === stat.size &&
+        h.Metadata?.["vault-mtime"] === String(Math.trunc(stat.mtimeMs))
+      ) {
+        skipped++;
+        continue;
+      }
+      await uploadFile(j.bucket, key, file);
+      count++;
+    }
+    j.lastSuccess = Date.now();
+    log(`Backup finished: ${j.name} · ${count} uploaded, ${skipped} unchanged`);
+  } catch (e) {
+    j.error = e.message;
+    log(`Backup failed: ${j.name} · ${e.message}`);
+  } finally {
+    j.running = false;
+    try {
+      persist();
+    } catch (error) {
+      j.error = "Could not save backup state: " + error.message;
+    }
+    emit();
+  }
+}
+function showMain(page) {
+  if (process.platform === "darwin") app.focus({ steal: true });
+  if (win.isMinimized()) win.restore();
+  win.show();
+  win.focus();
+  trayWindow?.hide();
+  if (page) win.webContents.send("vault:navigate", page);
+}
+function togglePanel() {
+  if (trayWindow.isVisible()) {
+    trayWindow.hide();
+    return;
+  }
+  const anchor = tray.getBounds(),
+    display = screen.getDisplayNearestPoint({
+      x: anchor.x,
+      y: anchor.y,
+    }).workArea;
+  const x = Math.max(
+    display.x,
+    Math.min(
+      anchor.x + anchor.width / 2 - 200,
+      display.x + display.width - 400,
+    ),
+  );
+  trayWindow.setPosition(
+    Math.round(x),
+    Math.max(display.y, anchor.y + anchor.height + 8),
+  );
+  trayWindow.show();
+  trayWindow.focus();
+}
+function createTray() {
+  const icon = nativeImage
+    .createFromPath(path.join(__dirname, "../assets/BlazeSyncTrayTemplate.png"))
+    .resize({ width: 18, height: 18 });
+  icon.setTemplateImage(true);
+  tray = new Tray(icon);
+  tray.setToolTip("BlazeSync");
+  trayWindow = new BrowserWindow({
+    width: 400,
+    height: 570,
+    show: false,
+    frame: false,
+    resizable: false,
+    skipTaskbar: true,
+    alwaysOnTop: true,
+    backgroundColor: "#181d28",
+    webPreferences: {
+      preload: path.join(__dirname, "preload.cjs"),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+    },
+  });
+  trayWindow.loadFile(path.join(__dirname, "../dist/tray.html"));
+  trayWindow.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+  trayWindow.webContents.on("will-navigate", (e) => e.preventDefault());
+  trayWindow.on("blur", () => {
+    if (!smoke) trayWindow.hide();
+  });
+  tray.on("click", togglePanel);
+  tray.on("drop-files", (_, paths) => dropOnTray(paths));
+  tray.on("right-click", () =>
+    tray.popUpContextMenu(
+      Menu.buildFromTemplate([
+        { label: "Open BlazeSync", click: () => showMain("files") },
+        { label: "Files", click: () => showMain("library") },
+        { label: "Photos", click: () => showMain("photos") },
+        { label: "Folder backups", click: () => showMain("backups") },
+        { label: "Transfers", click: () => showMain("transfers") },
+        { label: "Connection settings", click: () => showMain("settings") },
+        { type: "separator" },
+        { label: "Quit BlazeSync", click: () => app.quit() },
+      ]),
+    ),
+  );
+}
+const handlers = {
+  folderStats: (_, bucket, prefix = "", force = false) =>
+    folderMetrics.read(getClient(), bucket, prefix, force),
+  setRefresh: (_, seconds) => {
+    if (![15, 30, 60, 0].includes(seconds))
+      throw new Error("Choose a supported refresh interval");
+    preferences.refreshSeconds = seconds;
+    savePreferences();
+    emit();
+  },
+  history: (_, bucket, prefix = "", marker) =>
+    historyPage(getClient(), bucket, prefix, marker),
+  purgeFile: async (_, bucket, key) => {
+    blockBusyDelete(bucket, key);
+    const entries = await exactVersions(getClient(), bucket, key);
+    if (!entries.length) {
+      cloudChanged();
+      return { deleted: 0 };
+    }
+    const answer = await dialog.showMessageBox(win, {
+      type: "warning",
+      message: "Permanently delete all versions?",
+      detail:
+        key +
+        "\n" +
+        entries.length +
+        " stored version(s) and delete marker(s). This removes them from Backblaze, cannot be undone and cannot bypass retention or legal holds.",
+      buttons: ["Cancel", "Permanently delete"],
+      cancelId: 0,
+      defaultId: 0,
+    });
+    if (answer.response !== 1) return false;
+    blockBusyDelete(bucket, key);
+    try {
+      const deleted = await purgeVersions(getClient(), bucket, key, entries);
+      cloudChanged();
+      log("Permanently deleted all versions: " + key);
+      return { deleted };
+    } catch (error) {
+      cloudChanged();
+      throw deleteError(error);
+    }
+  },
+
+  setTheme: (_, theme) => {
+    if (!["dark", "light", "system"].includes(theme))
+      throw new Error("Unknown theme");
+    preferences.theme = theme;
+    nativeTheme.themeSource = theme;
+    savePreferences();
+    emit();
+  },
+  setUploadTarget: (_, bucket, prefix = "") => {
+    getClient();
+    if (!bucket) return;
+    preferences.uploadTarget = {
+      bucket,
+      prefix,
+      endpoint: connection.endpoint,
+      keyId: connection.keyId,
+    };
+    savePreferences();
+    emit();
+  },
+  uploadPaths: (_, bucket, prefix, paths) => queuePaths(bucket, prefix, paths),
+  editConnection: async () => {
+    const result = await dialog.showMessageBox(win, {
+      type: "question",
+      message: "Change the saved connection?",
+      detail:
+        "Your current connection stays active until replacement credentials are verified.",
+      buttons: ["Cancel", "Change connection"],
+      defaultId: 0,
+      cancelId: 0,
+    });
+    if (result.response === 1) {
+      connectionEditing = true;
+      emit();
+      return true;
+    }
+    return false;
+  },
+  cancelConnectionEdit: () => {
+    connectionEditing = false;
+    emit();
+  },
+
+  openKeys: () =>
+    shell.openExternal("https://secure.backblaze.com/app_keys.htm"),
+  openPage: (_, page) => {
+    if (
+      ![
+        "files",
+        "library",
+        "photos",
+        "backups",
+        "transfers",
+        "activity",
+        "settings",
+      ].includes(page)
+    )
+      throw new Error("Unknown page");
+    showMain(page);
+  },
+  quit: () => app.quit(),
+  catalog: async (_, bucket, token) => {
+    const r = await getClient().send(
+      new ListObjectsV2Command({
+        Bucket: bucket,
+        MaxKeys: 1000,
+        ContinuationToken: token || undefined,
+      }),
+    );
+    return {
+      files: (r.Contents || [])
+        .filter((f) => !f.Key.endsWith("/"))
+        .map((f) => ({
+          key: f.Key,
+          size: f.Size,
+          modified: f.LastModified?.toISOString(),
+          photo: isPhoto(f.Key),
+          preview: canPreview(f.Key),
+        })),
+      next: r.NextContinuationToken,
+    };
+  },
+  preview: async (_, bucket, key) => {
+    if (!canPreview(key))
+      throw new Error(
+        "This image format needs an external viewer. Download the original to view it.",
+      );
+    return getSignedUrl(
+      getClient(),
+      new GetObjectCommand({ Bucket: bucket, Key: key }),
+      { expiresIn: 900 },
+    );
+  },
+  state: () => publicState(),
+  connect: async (_, input) => {
+    if (client && !connectionEditing)
+      throw new Error(
+        "Saved credentials are locked. Choose Change connection first.",
+      );
+    if (
+      active.size ||
+      jobs.some((j) => j.running) ||
+      transfers.some((t) => t.status === "queued")
+    )
+      throw new Error("Wait for active transfers and backups to finish.");
+    const c = await discoverConnection(input),
+      next = makeClient(c);
+    const buckets = await connectionBuckets(c, next);
+    if (buckets[0])
+      await next.send(
+        new ListObjectsV2Command({ Bucket: buckets[0].Name, MaxKeys: 1 }),
+      );
+    persist(c);
+    connectionEditing = false;
+    folderMetrics.invalidate();
+    connection = c;
+    pendingSavedSecret = null;
+    client = next;
+    health = "online";
+    log("Connected to Backblaze B2");
+    return { state: publicState(), buckets };
+  },
+  disconnect: async () => {
+    if (
+      active.size ||
+      jobs.some((j) => j.running) ||
+      transfers.some((t) => t.status === "queued")
+    )
+      throw new Error("Finish or cancel transfers before disconnecting.");
+    const answer = await dialog.showMessageBox(win, {
+      type: "question",
+      message: "Disconnect this Mac?",
+      detail: "This removes the saved key. Cloud files stay unchanged.",
+      buttons: ["Cancel", "Disconnect"],
+      cancelId: 0,
+      defaultId: 0,
+    });
+    if (answer.response !== 1) return false;
+    connectionEditing = false;
+    persist(null);
+    pendingSavedSecret = null;
+    client = null;
+    connection = null;
+    health = "checking";
+    jobs = jobs.map((j) => ({ ...j, enabled: false }));
+    persist();
+    emit();
+  },
+  list: async (_, bucket, prefix = "", token) => {
+    const c = getClient();
+    if (!bucket)
+      return {
+        buckets: await connectionBuckets(),
+      };
+    const r = await c.send(
+      new ListObjectsV2Command({
+        Bucket: bucket,
+        Prefix: prefix,
+        Delimiter: "/",
+        MaxKeys: 1000,
+        ContinuationToken: token || undefined,
+      }),
+    );
+    return {
+      folders: (r.CommonPrefixes || []).map((p) => p.Prefix),
+      files: (r.Contents || [])
+        .filter((f) => f.Key !== prefix)
+        .map((f) => ({
+          key: f.Key,
+          size: f.Size,
+          modified: f.LastModified?.toISOString(),
+        })),
+      next: r.NextContinuationToken,
+    };
+  },
+  upload: async (_, bucket, prefix) => {
+    getClient();
+    const result = await dialog.showOpenDialog(win, {
+      properties: ["openFile", "openDirectory", "multiSelections"],
+    });
+    if (!result.canceled) return queuePaths(bucket, prefix, result.filePaths);
+  },
+  download: async (_, bucket, key) => {
+    getClient();
+    const result = await dialog.showSaveDialog(win, {
+      defaultPath: path.basename(key),
+    });
+    if (!result.canceled)
+      downloadToFile(bucket, key, result.filePath).catch(() => {});
+  },
+  downloadFolder: async (_, bucket, prefix) => {
+    getClient();
+    if (prefix && !prefix.endsWith("/"))
+      throw new Error("Choose a folder, not a file.");
+    const selected = await dialog.showOpenDialog(win, {
+      title: "Save complete folder",
+      properties: ["openDirectory", "createDirectory"],
+    });
+    if (selected.canceled) return;
+    const objects = await listTree(bucket, prefix);
+    const name = (prefix.split("/").filter(Boolean).pop() || bucket).replace(
+      /[\/\\\0]/g,
+      "_",
+    );
+    const root = path.join(
+      selected.filePaths[0],
+      name + "-" + Date.now() + "-" + crypto.randomUUID().slice(0, 4),
+    );
+    const destinations = objects
+      .map((object) => ({ object, relative: object.Key.slice(prefix.length) }))
+      .filter((x) => x.relative)
+      .map((x) => ({ ...x, destination: safeDownloadPath(root, x.relative) }));
+    await fsp.mkdir(root, { recursive: false });
+    let count = 0;
+    const promises = [];
+    for (const item of destinations) {
+      if (item.object.Key.endsWith("/"))
+        await fsp.mkdir(item.destination, { recursive: true });
+      else {
+        count++;
+        promises.push(
+          downloadToFile(bucket, item.object.Key, item.destination, root),
+        );
+      }
+    }
+    Promise.allSettled(promises).then((results) => {
+      const failed = results.filter((r) => r.status === "rejected").length;
+      log(
+        failed
+          ? "Folder download finished with " +
+              failed +
+              " failed/cancelled file(s). See Transfers."
+          : "Folder download complete: " + root,
+      );
+    });
+    log("Queued complete folder: " + count + " file(s)");
+    return { files: count, destination: root };
+  },
+  remove: async (_, bucket, key) => {
+    blockBusyDelete(bucket, key);
+    const result = await dialog.showMessageBox(win, {
+      type: "warning",
+      message: "Delete this file from Backblaze?",
+      detail:
+        key +
+        "\nHide current file removes it from the live file list. Older versions remain in Backblaze history. To remove stored versions too, choose Delete all versions.",
+      buttons: ["Cancel", "Hide current file", "Delete all versions"],
+      defaultId: 0,
+      cancelId: 0,
+    });
+    if (result.response === 2) return handlers.purgeFile(null, bucket, key);
+    if (result.response !== 1) return false;
+    blockBusyDelete(bucket, key);
+    await deleteKey(bucket, key);
+    const remaining = await getClient().send(
+      new ListObjectsV2Command({ Bucket: bucket, Prefix: key, MaxKeys: 1 }),
+    );
+    if (remaining.Contents?.some((f) => f.Key === key))
+      throw new Error(
+        "Backblaze has not confirmed deletion yet. Refresh and try again.",
+      );
+    cloudChanged();
+    log("Deleted: " + key);
+    return true;
+  },
+  removeFolder: async (_, bucket, prefix) => {
+    if (!prefix || !prefix.endsWith("/"))
+      throw new Error("Choose a non-root folder to delete.");
+    blockBusyDelete(bucket, prefix, true);
+    const objects = await listTree(bucket, prefix);
+    const answer = await dialog.showMessageBox(win, {
+      type: "warning",
+      message: "Delete this folder and all current files?",
+      detail:
+        prefix +
+        "\n" +
+        objects.length +
+        " objects. Older versions may remain; retention rules apply.",
+      buttons: ["Cancel", "Delete folder"],
+      cancelId: 0,
+      defaultId: 0,
+    });
+    if (answer.response !== 1) return false;
+    blockBusyDelete(bucket, prefix, true);
+    let removed = 0;
+    try {
+      for (const object of objects) {
+        await deleteKey(bucket, object.Key);
+        removed++;
+      }
+    } catch (error) {
+      cloudChanged();
+      throw new Error(
+        removed + " objects deleted before the error: " + error.message,
+      );
+    }
+    cloudChanged();
+    const remaining = await getClient().send(
+      new ListObjectsV2Command({ Bucket: bucket, Prefix: prefix, MaxKeys: 1 }),
+    );
+    if (remaining.Contents?.length)
+      throw new Error(
+        "Some files remain in this cloud folder. Another upload or retention rule may be preventing complete deletion.",
+      );
+    log("Deleted folder: " + prefix);
+    return { deleted: removed };
+  },
+  versions: async (_, bucket, key, marker) => {
+    const r = await getClient().send(
+      new ListObjectVersionsCommand({
+        Bucket: bucket,
+        Prefix: key,
+        MaxKeys: 1000,
+        KeyMarker: marker?.key,
+        VersionIdMarker: marker?.version,
+      }),
+    );
+    return {
+      versions: (r.Versions || [])
+        .filter((v) => v.Key === key)
+        .map((v) => ({
+          id: v.VersionId,
+          size: v.Size,
+          modified: v.LastModified?.toISOString(),
+          latest: v.IsLatest,
+        })),
+      markers: (r.DeleteMarkers || [])
+        .filter((v) => v.Key === key)
+        .map((v) => ({
+          id: v.VersionId,
+          modified: v.LastModified?.toISOString(),
+          latest: v.IsLatest,
+        })),
+      next: r.IsTruncated
+        ? { key: r.NextKeyMarker, version: r.NextVersionIdMarker }
+        : null,
+    };
+  },
+  restore: async (_, bucket, key, version) => {
+    const head = await getClient().send(
+      new HeadObjectCommand({ Bucket: bucket, Key: key, VersionId: version }),
+    );
+    if (head.ContentLength > 5 * 1024 ** 3)
+      throw new Error(
+        "In-app restore currently supports versions up to 5 GB. Download the larger version using Backblaze.",
+      );
+    const r = await dialog.showMessageBox(win, {
+      message: "Restore this version?",
+      detail: "A new current copy of " + key + " will be created.",
+      buttons: ["Cancel", "Restore"],
+      cancelId: 0,
+    });
+    if (r.response !== 1) return false;
+    await getClient().send(
+      new CopyObjectCommand({
+        Bucket: bucket,
+        Key: key,
+        CopySource: copySource(bucket, key, version),
+      }),
+    );
+    cloudChanged();
+    log("Restored version: " + key);
+    return true;
+  },
+  share: async (_, bucket, key) => {
+    const url = await getSignedUrl(
+      getClient(),
+      new GetObjectCommand({ Bucket: bucket, Key: key }),
+      { expiresIn: 3600 },
+    );
+    clipboard.writeText(url);
+    return "Private download link copied. It expires in 1 hour; anyone with the link can download.";
+  },
+  mkdir: async (_, bucket, prefix, name) => {
+    name = typeof name === "string" ? name.trim() : "";
+    if (
+      !name?.trim() ||
+      /[\\/\x00-\x1f]/.test(name) ||
+      name === "." ||
+      name === ".."
+    )
+      throw new Error("Enter a folder name without slashes.");
+    await getClient().send(
+      new PutObjectCommand({
+        Bucket: bucket,
+        Key: joinKey(prefix, name.trim()) + "/",
+        Body: "",
+      }),
+    );
+    cloudChanged();
+  },
+  addBackup: async (_, bucket, prefix, interval) => {
+    getClient();
+    if (![5, 60, 1440].includes(interval))
+      throw new Error("Invalid backup interval");
+    const r = await dialog.showOpenDialog(win, {
+      properties: ["openDirectory"],
+    });
+    if (r.canceled) return;
+    const folder = r.filePaths[0];
+    const j = {
+      id: crypto.randomUUID(),
+      name: path.basename(folder),
+      folder,
+      bucket,
+      prefix:
+        joinKey(
+          prefix,
+          "Backups/" +
+            path.basename(folder) +
+            "-" +
+            crypto.randomUUID().slice(0, 6),
+        ) + "/",
+      interval,
+      enabled: true,
+      endpoint: connection.endpoint,
+      keyId: connection.keyId,
+    };
+    jobs.push(j);
+    persist();
+    emit();
+    return j;
+  },
+  runBackup: (_, id) => {
+    runBackup(id).catch((e) => log(e.message));
+  },
+  toggleBackup: (_, id) => {
+    const j = jobs.find((j) => j.id === id);
+    if (j) {
+      j.enabled = !j.enabled;
+      persist();
+      emit();
+    }
+  },
+  removeBackup: async (_, id) => {
+    const j = jobs.find((j) => j.id === id);
+    if (j?.running) throw new Error("Wait for this backup to finish.");
+    jobs = jobs.filter((j) => j.id !== id);
+    persist();
+    emit();
+  },
+  cancel: async (_, id) => {
+    const t = transfers.find((t) => t.id === id);
+    if (!t || !["queued", "running"].includes(t.status)) return;
+    t.status = "cancelled";
+    await active.get(id)?.();
+    emit();
+  },
+};
+app.setName("BlazeSync");
+const smoke = process.argv.includes("--smoke-test");
+if (smoke)
+  app.setPath(
+    "userData",
+    path.join(app.getPath("temp"), "blazesync-smoke-" + process.pid),
+  );
+const primaryInstance = app.requestSingleInstanceLock();
+if (!primaryInstance) app.quit();
+app.on("second-instance", () => {
+  if (win) showMain();
+});
+app.whenReady().then(() => {
+  if (!primaryInstance) return;
+  if (process.platform === "darwin") app.dock.hide();
+  try {
+    preferences = {
+      ...preferences,
+      ...JSON.parse(fs.readFileSync(preferencesPath(), "utf8")),
+    };
+  } catch {}
+  if (!["dark", "light", "system"].includes(preferences.theme))
+    preferences.theme = "dark";
+  if (![0, 15, 30, 60].includes(preferences.refreshSeconds))
+    preferences.refreshSeconds = 15;
+  nativeTheme.themeSource = preferences.theme;
+  nativeTheme.on("updated", emit);
+  setInterval(() => {
+    let changed = false;
+    for (const t of transfers)
+      if (
+        t.status === "running" &&
+        t.lastProgressAt &&
+        Date.now() - t.lastProgressAt > 3000 &&
+        t.speed
+      ) {
+        t.speed = 0;
+        t.eta = null;
+        changed = true;
+      }
+    if (changed) emit();
+  }, 1000);
+
+  try {
+    const s = JSON.parse(fs.readFileSync(statePath(), "utf8"));
+    jobs = (s.jobs || []).map((j) => ({ ...j, running: false }));
+    pendingSavedSecret = s.secret || null;
+    restoreSavedConnection();
+  } catch (e) {
+    if (e.code !== "ENOENT")
+      events.push({
+        id: crypto.randomUUID(),
+        at: Date.now(),
+        message:
+          "Saved connection could not be read. Your stored data has been kept. Check Settings.",
+      });
+  }
+  for (const [name, fn] of Object.entries(handlers))
+    ipcMain.handle("vault:" + name, async (e, ...args) => {
+      if (e.sender !== win.webContents && e.sender !== trayWindow?.webContents)
+        throw new Error("Unknown window");
+      try {
+        return await fn(e, ...args);
+      } catch (err) {
+        throw new Error(err.message);
+      }
+    });
+  win = new BrowserWindow({
+    width: 1320,
+    height: 860,
+    minWidth: 760,
+    minHeight: 700,
+    title: "BlazeSync",
+    show: false,
+    backgroundColor: "#f7f8fa",
+    webPreferences: {
+      preload: path.join(__dirname, "preload.cjs"),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+    },
+  });
+  win.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+  win.webContents.on("will-navigate", (event) => event.preventDefault());
+  win.on("close", (event) => {
+    if (!isQuitting) {
+      event.preventDefault();
+      win.hide();
+    }
+  });
+  win.loadFile(path.join(__dirname, "../dist/index.html"));
+  createTray();
+  if (smoke)
+    win.webContents.once("did-finish-load", async () => {
+      try {
+        await require("./smoke.cjs")({
+          app,
+          win,
+          trayWindow,
+          tray,
+          showMain,
+          togglePanel,
+          handlers,
+          dialog,
+          uploadFile,
+          runBackup,
+          jobs,
+          getState: publicState,
+          emit,
+          progressEmit,
+          checkConnection,
+          restoreSavedConnection,
+          simulateLockedSave: () => {
+            const saved = JSON.parse(fs.readFileSync(statePath(), "utf8"));
+            pendingSavedSecret = saved.secret;
+            client = null;
+            connection = null;
+            persist();
+            const kept =
+              JSON.parse(fs.readFileSync(statePath(), "utf8")).secret ===
+              saved.secret;
+            restoreSavedConnection();
+            return kept;
+          },
+          simulateRestart: () => {
+            const saved = JSON.parse(fs.readFileSync(statePath(), "utf8"));
+            pendingSavedSecret = saved.secret;
+            client = null;
+            connection = null;
+            restoreSavedConnection();
+          },
+          setTestConnection: (c, s3) => {
+            connection = c;
+            client = s3;
+            emit();
+          },
+          outputDir:
+            process.env.BLAZESYNC_SMOKE_OUTPUT ||
+            path.join(__dirname, "../assets"),
+        });
+      } catch (error) {
+        console.error(error);
+        app.exit(1);
+      }
+    });
+  if (!smoke) {
+    checkConnection();
+    setInterval(checkConnection, 30000);
+    powerMonitor.on("resume", checkConnection);
+    powerMonitor.on("unlock-screen", checkConnection);
+  }
+  setInterval(() => {
+    if (client)
+      for (const j of jobs)
+        if (
+          due(j) &&
+          j.endpoint === connection.endpoint &&
+          j.keyId === connection.keyId
+        )
+          runBackup(j.id).catch((e) => log(e.message));
+  }, 30000);
+});
+app.on("window-all-closed", () => {
+  if (isQuitting) app.quit();
+});
+app.on("activate", () => {
+  if (win) showMain();
+});
+app.on("will-quit", () => {
+  isQuitting = true;
+  if (progressTimer) {
+    clearTimeout(progressTimer);
+    progressTimer = null;
+  }
+  if (tray && !tray.isDestroyed()) tray.destroy();
+});
+app.on("before-quit", (event) => {
+  isQuitting = true;
+  if (
+    active.size ||
+    jobs.some((j) => j.running) ||
+    transfers.some((t) => t.status === "queued")
+  ) {
+    showMain("transfers");
+    const choice = dialog.showMessageBoxSync(win, {
+      type: "warning",
+      message: "Transfers or backups are still running.",
+      detail:
+        "Keep BlazeSync open to finish them. Quitting interrupts active work.",
+      buttons: ["Keep open", "Quit anyway"],
+      defaultId: 0,
+      cancelId: 0,
+    });
+    if (choice === 0) {
+      event.preventDefault();
+      isQuitting = false;
+    }
+  }
+});
