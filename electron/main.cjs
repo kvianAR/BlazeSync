@@ -64,6 +64,40 @@ const {
 } = require("./files.cjs");
 const { FolderMetrics } = require("./folder-metrics.cjs");
 const folderMetrics = new FolderMetrics();
+const { scanStorage } = require("./billing.cjs");
+const {
+  normalizeSelection,
+  selectedObjects,
+  createMovePlan,
+  executeMove,
+  baseName,
+} = require("./file-management.cjs");
+let fileOperation = null,
+  billingCache = null,
+  billingPending = null,
+  billingProgress = null;
+function assertNoFileOperation() {
+  if (fileOperation)
+    throw new Error("Wait for the current file operation to finish.");
+}
+async function withFileOperation(label, run) {
+  assertNoFileOperation();
+  if (jobs.some((job) => job.running))
+    throw new Error("Wait for the running folder backup to finish.");
+  const sdk = getClient();
+  fileOperation = { label, stage: "preparing", completed: 0, total: 0 };
+  emit();
+  try {
+    return await run(sdk, (progress) => {
+      fileOperation = { label, ...progress };
+      emit();
+    });
+  } finally {
+    fileOperation = null;
+    emit();
+  }
+}
+
 function connectionId() {
   return connection
     ? createHash("sha256")
@@ -86,6 +120,7 @@ function savePreferences() {
 }
 function cloudChanged() {
   folderMetrics.invalidate();
+  billingCache = null;
   revision++;
   emit();
 }
@@ -149,6 +184,9 @@ function persist(savedConnection = connection) {
 function publicState() {
   return {
     connected: !!client,
+    fileOperation,
+    billingProgress,
+    billingBudgetUsd: preferences.billingBudgetUsd || 0,
     connectionId: connectionId(),
     health,
     revision,
@@ -381,21 +419,65 @@ async function uploadFile(bucket, key, file, directory = false, size = 0) {
   return result;
 }
 async function queuePaths(bucket, prefix, paths) {
-  getClient();
   if (!bucket) throw new Error("Select an upload bucket first.");
-  let count = 0;
-  for await (const entry of uploadEntries(paths, prefix)) {
-    uploadFile(
-      bucket,
-      entry.key,
-      entry.file,
-      entry.directory,
-      entry.size,
-    ).catch(() => {});
-    if (!entry.directory) count++;
-  }
-  log("Queued " + count + " file(s) for " + bucket + "/" + prefix);
-  return { files: count };
+  return withFileOperation(
+    "Checking upload destination",
+    async (sdk, progress) => {
+      const entries = [];
+      for await (const entry of uploadEntries(paths, prefix))
+        entries.push(entry);
+      const conflicts = [];
+      let checked = 0;
+      for (const entry of entries) {
+        if (!entry.directory) {
+          try {
+            await sdk.send(
+              new HeadObjectCommand({ Bucket: bucket, Key: entry.key }),
+            );
+            conflicts.push(entry.key);
+          } catch (error) {
+            if (
+              error.$metadata?.httpStatusCode !== 404 &&
+              error.name !== "NotFound"
+            )
+              throw error;
+          }
+        }
+        progress({
+          stage: "checking",
+          completed: ++checked,
+          total: entries.length,
+        });
+      }
+      if (conflicts.length) {
+        showMain();
+        const answer = await dialog.showMessageBox(win, {
+          type: "warning",
+          message: "Replace existing cloud files?",
+          detail:
+            conflicts.slice(0, 20).join("\n") +
+            "\n" +
+            conflicts.length +
+            " existing file(s) will get a new current version. Older versions may remain stored and billed.",
+          buttons: ["Cancel", "Replace current files"],
+          cancelId: 0,
+          defaultId: 0,
+        });
+        if (answer.response !== 1) return false;
+      }
+      for (const entry of entries)
+        uploadFile(
+          bucket,
+          entry.key,
+          entry.file,
+          entry.directory,
+          entry.size,
+        ).catch(() => {});
+      const count = entries.filter((entry) => !entry.directory).length;
+      log("Queued " + count + " file(s) for " + bucket + "/" + prefix);
+      return { files: count };
+    },
+  );
 }
 async function downloadToFile(bucket, key, destination, group = "") {
   const c = getClient(),
@@ -505,6 +587,7 @@ async function* walk(root) {
   }
 }
 async function runBackup(id) {
+  if (fileOperation) return;
   const j = jobs.find((j) => j.id === id);
   if (!j || j.running) return;
   if (!client) throw new Error("Connect your B2 account first.");
@@ -637,6 +720,269 @@ function createTray() {
   );
 }
 const handlers = {
+  setBillingBudget: (_, value) => {
+    if (!Number.isFinite(value) || value < 0 || value > 10000000)
+      throw new Error("Enter a valid monthly budget in USD.");
+    preferences.billingBudgetUsd = value;
+    savePreferences();
+    emit();
+  },
+  openPricing: () =>
+    shell.openExternal("https://www.backblaze.com/cloud-storage/pricing"),
+  openBackblaze: () =>
+    shell.openExternal("https://secure.backblaze.com/b2_buckets.htm"),
+  billing: async (_, force = false) => {
+    getClient();
+    const identity = connectionId(),
+      scanRevision = revision;
+    if (
+      !force &&
+      billingCache?.identity === identity &&
+      billingCache.revision === scanRevision &&
+      Date.now() - billingCache.value.checkedAt < 300000
+    )
+      return billingCache.value;
+    if (billingPending?.identity === identity) return billingPending.promise;
+    const pending = { identity };
+    pending.promise = (async () => {
+      if (!connection.bucketScope) {
+        const discovered = await discoverConnection(connection);
+        if (connectionId() !== identity)
+          throw new Error("Connection changed during billing scan.");
+        connection = { ...connection, ...discovered };
+        persist();
+        emit();
+      }
+      const sdk = getClient();
+      const buckets = await connectionBuckets();
+      billingProgress = { completed: 0, total: buckets.length };
+      emit();
+      try {
+        const value = await scanStorage(
+          sdk,
+          buckets.map((bucket) => bucket.Name),
+          connection.bucketScope,
+          (progress) => {
+            if (connectionId() === identity) {
+              billingProgress = progress;
+              emit();
+            }
+          },
+        );
+        value.stale = revision !== scanRevision;
+        if (connectionId() === identity && !value.stale)
+          billingCache = { identity, revision: scanRevision, value };
+        return value;
+      } finally {
+        if (connectionId() === identity) {
+          billingProgress = null;
+          emit();
+        }
+      }
+    })().finally(() => {
+      if (billingPending === pending) billingPending = null;
+    });
+    billingPending = pending;
+    return pending.promise;
+  },
+  moveSelection: async (
+    _,
+    bucket,
+    entries,
+    destinationBucket,
+    destination,
+    newName,
+  ) =>
+    withFileOperation(
+      newName == null ? "Moving cloud items" : "Renaming cloud item",
+      async (sdk, progress) => {
+        const selection = normalizeSelection(entries);
+        for (const entry of selection)
+          blockBusyDelete(bucket, entry.key, entry.folder);
+        const plan = await createMovePlan(
+          sdk,
+          bucket,
+          selection,
+          destinationBucket,
+          destination,
+          newName,
+        );
+        for (const item of plan.objects)
+          blockBusyDelete(destinationBucket, item.target);
+        const label =
+          newName == null ? "Move selected items?" : "Rename selected item?";
+        const detail =
+          plan.selection
+            .map(
+              (entry) =>
+                entry.key + " → " + destinationBucket + "/" + entry.target,
+            )
+            .slice(0, 15)
+            .join("\n") +
+          "\n" +
+          plan.objects.length +
+          " current object(s)." +
+          (plan.conflicts.length
+            ? "\n" +
+              plan.conflicts.length +
+              " existing destination file(s) will be replaced."
+            : "") +
+          "\nSources are removed after copies are verified. Retained versions may continue using storage.";
+        const answer = await dialog.showMessageBox(win, {
+          type: plan.conflicts.length ? "warning" : "question",
+          message: label,
+          detail,
+          buttons: [
+            "Cancel",
+            plan.conflicts.length ? "Replace and move" : "Confirm",
+          ],
+          cancelId: 0,
+          defaultId: 0,
+        });
+        if (answer.response !== 1) return false;
+        try {
+          const result = await executeMove(sdk, plan, true, progress);
+          log("Cloud items " + (newName == null ? "moved" : "renamed"));
+          return result;
+        } finally {
+          cloudChanged();
+        }
+      },
+    ),
+  downloadSelection: async (_, bucket, entries) =>
+    withFileOperation("Preparing bulk download", async (sdk) => {
+      const selection = normalizeSelection(entries);
+      const chosen = await dialog.showOpenDialog(win, {
+        title: "Download selected files and folders",
+        properties: ["openDirectory", "createDirectory"],
+      });
+      if (chosen.canceled) return false;
+      const objects = await selectedObjects(sdk, bucket, selection);
+      const root = path.join(
+        chosen.filePaths[0],
+        "BlazeSync-download-" +
+          Date.now() +
+          "-" +
+          crypto.randomUUID().slice(0, 5),
+      );
+      const parent =
+        selection.length === 1
+          ? selection[0].key
+              .replace(/\/$/, "")
+              .split("/")
+              .slice(0, -1)
+              .join("/") + "/"
+          : "";
+      const prefix = parent === "/" ? "" : parent;
+      const destinations = objects.map((object) => ({
+        object,
+        destination: safeDownloadPath(root, object.key.slice(prefix.length)),
+      }));
+      const files = destinations.filter(
+        (item) => !item.object.key.endsWith("/"),
+      );
+      for (const file of files) {
+        if (
+          destinations.some(
+            (item) =>
+              item !== file &&
+              item.destination.startsWith(file.destination + path.sep),
+          )
+        )
+          throw new Error(
+            "A selected file conflicts with a folder of the same name. Download them separately.",
+          );
+      }
+      await fsp.mkdir(root, { recursive: false });
+      for (const item of destinations.filter((item) =>
+        item.object.key.endsWith("/"),
+      ))
+        await fsp.mkdir(item.destination, { recursive: true });
+      const results = files.map((item) =>
+        downloadToFile(bucket, item.object.key, item.destination, root),
+      );
+      Promise.allSettled(results).then((values) => {
+        const failed = values.filter(
+          (value) => value.status === "rejected",
+        ).length;
+        log(
+          "Bulk download finished: " +
+            files.length +
+            " files, " +
+            failed +
+            " failed/cancelled.",
+        );
+      });
+      return { files: files.length, destination: root };
+    }),
+  removeSelection: async (_, bucket, entries) =>
+    withFileOperation(
+      "Deleting selected current objects",
+      async (sdk, progress) => {
+        const selection = normalizeSelection(entries);
+        for (const entry of selection)
+          blockBusyDelete(bucket, entry.key, entry.folder);
+        const objects = await selectedObjects(sdk, bucket, selection);
+        const answer = await dialog.showMessageBox(win, {
+          type: "warning",
+          message: "Delete selected current files and folders?",
+          detail:
+            selection
+              .map((entry) => entry.key)
+              .slice(0, 20)
+              .join("\n") +
+            "\n" +
+            objects.length +
+            " current object(s). Stored older versions remain subject to Backblaze retention and billing.",
+          buttons: ["Cancel", "Delete selected"],
+          cancelId: 0,
+          defaultId: 0,
+        });
+        if (answer.response !== 1) return false;
+        let deleted = 0;
+        try {
+          for (const item of objects) {
+            await sdk.send(
+              new DeleteObjectCommand({ Bucket: bucket, Key: item.key }),
+            );
+            deleted++;
+            progress({
+              stage: "deleting",
+              completed: deleted,
+              total: objects.length,
+            });
+          }
+          for (const entry of selection) {
+            const remaining = await sdk.send(
+              new ListObjectsV2Command({
+                Bucket: bucket,
+                Prefix: entry.key,
+                MaxKeys: 1,
+              }),
+            );
+            if (
+              remaining.Contents?.some(
+                (item) => entry.folder || item.Key === entry.key,
+              )
+            )
+              throw new Error(
+                "Some selected source objects remain. Refresh and check the results.",
+              );
+          }
+          log("Deleted " + deleted + " selected current object(s)");
+          return { deleted };
+        } catch (error) {
+          throw new Error(
+            deleted +
+              " object(s) deleted before the error. " +
+              deleteError(error).message,
+          );
+        } finally {
+          cloudChanged();
+        }
+      },
+    ),
+
   folderStats: (_, bucket, prefix = "", force = false) =>
     folderMetrics.read(getClient(), bucket, prefix, force),
   setRefresh: (_, seconds) => {
@@ -649,6 +995,7 @@ const handlers = {
   history: (_, bucket, prefix = "", marker) =>
     historyPage(getClient(), bucket, prefix, marker),
   purgeFile: async (_, bucket, key) => {
+    assertNoFileOperation();
     blockBusyDelete(bucket, key);
     const entries = await exactVersions(getClient(), bucket, key);
     if (!entries.length) {
@@ -668,6 +1015,7 @@ const handlers = {
       defaultId: 0,
     });
     if (answer.response !== 1) return false;
+    assertNoFileOperation();
     blockBusyDelete(bucket, key);
     try {
       const deleted = await purgeVersions(getClient(), bucket, key, entries);
@@ -735,6 +1083,7 @@ const handlers = {
         "transfers",
         "activity",
         "settings",
+        "billing",
       ].includes(page)
     )
       throw new Error("Unknown page");
@@ -775,6 +1124,7 @@ const handlers = {
   },
   state: () => publicState(),
   connect: async (_, input) => {
+    assertNoFileOperation();
     if (client && !connectionEditing)
       throw new Error(
         "Saved credentials are locked. Choose Change connection first.",
@@ -792,6 +1142,9 @@ const handlers = {
       await next.send(
         new ListObjectsV2Command({ Bucket: buckets[0].Name, MaxKeys: 1 }),
       );
+    assertNoFileOperation();
+    if (active.size || jobs.some((job) => job.running) || transfers.some((transfer) => transfer.status === "queued"))
+      throw new Error("Wait for active transfers and backups to finish.");
     persist(c);
     connectionEditing = false;
     folderMetrics.invalidate();
@@ -803,6 +1156,7 @@ const handlers = {
     return { state: publicState(), buckets };
   },
   disconnect: async () => {
+    assertNoFileOperation();
     if (
       active.size ||
       jobs.some((j) => j.running) ||
@@ -818,6 +1172,9 @@ const handlers = {
       defaultId: 0,
     });
     if (answer.response !== 1) return false;
+    assertNoFileOperation();
+    if (active.size || jobs.some((job) => job.running) || transfers.some((transfer) => transfer.status === "queued"))
+      throw new Error("Finish or cancel transfers before disconnecting.");
     connectionEditing = false;
     persist(null);
     pendingSavedSecret = null;
@@ -919,6 +1276,7 @@ const handlers = {
     return { files: count, destination: root };
   },
   remove: async (_, bucket, key) => {
+    assertNoFileOperation();
     blockBusyDelete(bucket, key);
     const result = await dialog.showMessageBox(win, {
       type: "warning",
@@ -932,6 +1290,7 @@ const handlers = {
     });
     if (result.response === 2) return handlers.purgeFile(null, bucket, key);
     if (result.response !== 1) return false;
+    assertNoFileOperation();
     blockBusyDelete(bucket, key);
     await deleteKey(bucket, key);
     const remaining = await getClient().send(
@@ -946,6 +1305,7 @@ const handlers = {
     return true;
   },
   removeFolder: async (_, bucket, prefix) => {
+    assertNoFileOperation();
     if (!prefix || !prefix.endsWith("/"))
       throw new Error("Choose a non-root folder to delete.");
     blockBusyDelete(bucket, prefix, true);
@@ -963,6 +1323,7 @@ const handlers = {
       defaultId: 0,
     });
     if (answer.response !== 1) return false;
+    assertNoFileOperation();
     blockBusyDelete(bucket, prefix, true);
     let removed = 0;
     try {
@@ -1019,6 +1380,7 @@ const handlers = {
     };
   },
   restore: async (_, bucket, key, version) => {
+    assertNoFileOperation();
     const head = await getClient().send(
       new HeadObjectCommand({ Bucket: bucket, Key: key, VersionId: version }),
     );
@@ -1033,6 +1395,7 @@ const handlers = {
       cancelId: 0,
     });
     if (r.response !== 1) return false;
+    assertNoFileOperation();
     await getClient().send(
       new CopyObjectCommand({
         Bucket: bucket,
@@ -1054,6 +1417,7 @@ const handlers = {
     return "Private download link copied. It expires in 1 hour; anyone with the link can download.";
   },
   mkdir: async (_, bucket, prefix, name) => {
+    assertNoFileOperation();
     name = typeof name === "string" ? name.trim() : "";
     if (
       !name?.trim() ||
@@ -1310,7 +1674,8 @@ app.on("before-quit", (event) => {
   if (
     active.size ||
     jobs.some((j) => j.running) ||
-    transfers.some((t) => t.status === "queued")
+    transfers.some((t) => t.status === "queued") ||
+    fileOperation
   ) {
     showMain("transfers");
     const choice = dialog.showMessageBoxSync(win, {

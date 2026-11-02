@@ -99,6 +99,7 @@ async function discoverConnection(input, request = fetch, delay = wait) {
   return {
     ...c,
     buckets,
+    bucketScope: Array.isArray(restricted) ? "restricted" : "account",
     expiresAt: result.applicationKeyExpirationTimestamp || null,
   };
 }

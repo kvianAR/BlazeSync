@@ -31,6 +31,8 @@ BlazeSync brings B2 files, folders, transfers, version history and one-way backu
 | Capability | What you can do |
 | --- | --- |
 | **Files and folders** | Browse buckets and nested folders, create folders, search loaded listings, and download a complete folder with its structure. |
+| **Selection and moves** | Select multiple files/folders for download, delete or move. Rename individual items and confirm destination overwrites. Moves verify copies before removing current sources. |
+| **Storage and billing** | Scan current files, retained versions and unfinished uploads. Project 30-day USD storage cost with the account-wide 10 GB allowance and a local budget alert. |
 | **Drag and drop** | Drop files/folders on the main app, mini panel or native menu-bar icon. The selected bucket/folder is the upload destination. |
 | **Accurate folder sizes** | See recursive current-file totals and per-folder file counts across all listing pages, not just the first 1,000 objects. |
 | **Transfers** | Follow queued/running/completed/failed/cancelled states, progress, estimated speed and remaining time. |
@@ -40,6 +42,16 @@ BlazeSync brings B2 files, folders, transfers, version history and one-way backu
 | **Private connection** | Enter just Key ID and Application Key. Endpoint and bucket discovery are automatic; saved credentials stay encrypted and locked. |
 | **Menu-bar app** | Keep BlazeSync running without a Dock icon. Close the window to hide it; choose Quit to stop it. |
 | **Light and dark** | A consistent interface with saved theme preference and configurable cloud-list refresh. |
+
+### Storage pricing
+
+The Storage & billing page uses Backblaze B2 Fundamentals public pricing, verified on November 3, 2026. The first 10 GB is free once per account. Storage above this allowance costs $6.95 per decimal TB per 30 days. At constant usage, 100 GB projects to $0.63 and 1 TB to $6.88 for 30 days.
+
+The app projects storage charges at the current scanned amount. Actual invoices use byte-hours and may include egress, transactions, taxes or account-specific terms. Restricted keys and incomplete scans show visible-storage coverage and an estimate range. Refresh usage after external cloud changes. The rate is a dated published snapshot, with an official pricing link in the app.
+
+Moves and ordinary deletion can retain older B2 versions, which continue using storage. Review Versions & deleted before choosing an explicit permanent purge. Cloud moves copy and verify destinations before removing sources. Concurrent changes or failures can leave a partial move with verified destination copies preserved.
+
+[Backblaze public pricing](https://www.backblaze.com/cloud-storage/pricing)
 
 ## Download and install
 

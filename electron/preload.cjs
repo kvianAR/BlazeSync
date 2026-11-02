@@ -1,7 +1,16 @@
 const { contextBridge, ipcRenderer, webUtils } = require("electron");
 const methods = [
+  "billing",
+  "setBillingBudget",
+  "openPricing",
+  "openBackblaze",
+  "moveSelection",
+  "downloadSelection",
+  "removeSelection",
   "folderStats",
-  "history", "purgeFile", "setRefresh",
+  "history",
+  "purgeFile",
+  "setRefresh",
   "setTheme",
   "setUploadTarget",
   "editConnection",

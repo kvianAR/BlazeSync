@@ -201,6 +201,16 @@ module.exports = async function smoke(ctx) {
           });
         if (headers["x-amz-copy-source"]) {
           copies++;
+          const source = headers["x-amz-copy-source"]
+            .split("?")[0]
+            .split("/")
+            .slice(1)
+            .map(decodeURIComponent)
+            .join("/");
+          if (objects.has(source)) {
+            objects.set(key, Buffer.from(objects.get(source)));
+            if (metadata.has(source)) metadata.set(key, metadata.get(source));
+          }
           body =
             '<CopyObjectResult><LastModified>2026-11-02T00:00:00Z</LastModified><ETag>"test"</ETag></CopyObjectResult>';
         } else {
@@ -220,6 +230,13 @@ module.exports = async function smoke(ctx) {
           statusCode = 404;
         } else {
           extra["content-length"] = String(objects.get(key).length);
+          extra.etag =
+            '"' +
+            require("node:crypto")
+              .createHash("sha256")
+              .update(objects.get(key))
+              .digest("hex") +
+            '"';
           if (metadata.has(key))
             extra["x-amz-meta-vault-mtime"] = metadata.get(key);
         }
@@ -243,12 +260,22 @@ module.exports = async function smoke(ctx) {
           if (index >= 0) hiddenHistory.splice(index, 1);
         } else objects.delete(key);
         statusCode = 204;
+      } else if (req.method === "GET" && "uploads" in q) {
+        body =
+          "<ListMultipartUploadsResult><IsTruncated>false</IsTruncated></ListMultipartUploadsResult>";
       } else if ("versions" in q) {
         const hidden = hiddenHistory.filter((v) =>
           v.key.startsWith(q.prefix || ""),
         );
         body =
-          "<ListVersionsResult>" +
+          "<ListVersionsResult><IsTruncated>false</IsTruncated>" +
+          [...objects]
+            .filter(([name]) => name.startsWith(q.prefix || ""))
+            .map(
+              ([name, value]) =>
+                `<Version><Key>${xml(name)}</Key><VersionId>current</VersionId><IsLatest>true</IsLatest><Size>${value.length}</Size></Version>`,
+            )
+            .join("") +
           hidden
             .map((v) =>
               v.deleted
@@ -304,6 +331,7 @@ module.exports = async function smoke(ctx) {
   const connection = {
     endpoint: "https://s3.us-west-004.backblazeb2.com",
     region: "us-west-004",
+    bucketScope: "account",
     keyId: "test-key",
     applicationKey: "not-a-real-key",
     bucket: "test-bucket",
@@ -384,7 +412,7 @@ module.exports = async function smoke(ctx) {
     "test-bucket",
     "Photos/sunset.JPG",
   );
-  assert.equal(versions.versions[0].id, "old+/=");
+  assert.ok(versions.versions.some((version) => version.id === "old+/="));
   await handlers.restore(null, "test-bucket", "Photos/sunset.JPG", "old+/=");
   assert.equal(copies, 1);
   checks.push("version history and copy restore through S3 SDK fixture");
@@ -634,7 +662,7 @@ module.exports = async function smoke(ctx) {
   );
   await waitFor(
     async () =>
-      (await inspect('document.querySelectorAll(".history-row").length')) === 2,
+      (await inspect('document.querySelectorAll(".history-row").length')) >= 2,
   );
   assert.ok(
     (await inspect("document.body.innerText")).includes("Hidden / deleted"),
@@ -778,6 +806,155 @@ module.exports = async function smoke(ctx) {
   );
   setTestConnection(connection, mock);
   await fs.mkdir(path.join(temp, "upload-tests"), { recursive: true });
+  // Exercise billing and management through the same IPC handlers used by the app.
+  const usage = await handlers.billing(null, true);
+  assert.equal(usage.estimate.accountComplete, true);
+  assert.equal(
+    usage.currentBytes,
+    [...objects.values()].reduce((sum, value) => sum + value.length, 0),
+  );
+  assert.equal(usage.estimate.monthlyUsd, 0);
+  assert.equal(usage.pricing.usdPerTbPer30Days, 6.95);
+  await handlers.setBillingBudget(null, 5);
+  assert.equal(getState().billingBudgetUsd, 5);
+  await nav("billing");
+  await waitFor(async () =>
+    (await inspect("document.body.innerText")).includes(
+      "ACCOUNT STORAGE PROJECTION",
+    ),
+  );
+  assert.ok((await inspect("document.body.innerText")).includes("$6.95"));
+  await fs.writeFile(
+    path.join(outputDir, "BlazeSync-billing-dark.png"),
+    (await win.webContents.capturePage()).toPNG(),
+  );
+  checks.push(
+    "billing scans current and retained versions, applies account allowance and renders published pricing",
+  );
+  objects.set("Manage/first.txt", Buffer.from("first file"));
+  objects.set("Manage/nested/second.txt", Buffer.from("second file"));
+  dialog.showMessageBox = async () => ({ response: 0 });
+  assert.equal(
+    await handlers.moveSelection(
+      null,
+      "test-bucket",
+      [{ key: "Manage/first.txt" }],
+      "test-bucket",
+      "Manage/",
+      "renamed.txt",
+    ),
+    false,
+  );
+  assert.equal(objects.has("Manage/first.txt"), true);
+  dialog.showMessageBox = async () => ({ response: 1 });
+  await handlers.moveSelection(
+    null,
+    "test-bucket",
+    [{ key: "Manage/first.txt" }],
+    "test-bucket",
+    "Manage/",
+    "renamed.txt",
+  );
+  assert.equal(objects.has("Manage/first.txt"), false);
+  assert.equal(objects.get("Manage/renamed.txt").toString(), "first file");
+  await handlers.moveSelection(
+    null,
+    "test-bucket",
+    [{ key: "Manage/", folder: true }],
+    "test-bucket",
+    "Moved/",
+  );
+  assert.equal(objects.has("Manage/nested/second.txt"), false);
+  assert.equal(
+    objects.get("Moved/Manage/nested/second.txt").toString(),
+    "second file",
+  );
+  checks.push(
+    "rename cancellation, verified rename and nested folder move through IPC",
+  );
+  const entries = [
+    { key: "Moved/Manage/renamed.txt" },
+    { key: "Moved/Manage/nested/", folder: true },
+  ];
+  dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [temp] });
+  const bulk = await handlers.downloadSelection(null, "test-bucket", entries);
+  await waitFor(
+    () =>
+      getState().transfers.filter(
+        (transfer) =>
+          transfer.status === "queued" || transfer.status === "running",
+      ).length === 0,
+  );
+  await waitFor(async () => {
+    try {
+      return (
+        (await fs.readFile(
+          path.join(bulk.destination, "Moved/Manage/nested/second.txt"),
+          "utf8",
+        )) === "second file"
+      );
+    } catch {
+      return false;
+    }
+  });
+  assert.equal(
+    await fs.readFile(
+      path.join(bulk.destination, "Moved/Manage/renamed.txt"),
+      "utf8",
+    ),
+    "first file",
+  );
+  await handlers.removeSelection(null, "test-bucket", entries);
+  assert.equal(objects.has("Moved/Manage/renamed.txt"), false);
+  assert.equal(objects.has("Moved/Manage/nested/second.txt"), false);
+  checks.push(
+    "bulk download preserves selected hierarchy and confirmed bulk deletion removes cloud objects",
+  );
+  await nav("files");
+  await waitFor(
+    async () =>
+      await inspect(
+        '!!document.querySelector(".table-head input.item-select")',
+      ),
+  );
+  await inspect(
+    'document.querySelector(".table-head input.item-select").click()',
+  );
+  await waitFor(
+    async () => await inspect('!!document.querySelector(".selection-bar")'),
+  );
+  assert.ok(
+    (
+      await inspect('document.querySelector(".selection-bar").innerText')
+    ).includes("Move"),
+  );
+  await inspect(
+    '[...document.querySelectorAll(".selection-bar button")].find(button => button.textContent.includes("Clear")).click()',
+  );
+  checks.push(
+    "explorer select-all displays bulk management controls and clears selection",
+  );
+  objects.set("Overwrite/sample.txt", Buffer.from("existing"));
+  dialog.showMessageBox = async () => ({ response: 0 });
+  assert.equal(
+    await handlers.uploadPaths(null, "test-bucket", "Overwrite/", [local]),
+    false,
+  );
+  assert.equal(objects.get("Overwrite/sample.txt").toString(), "existing");
+  dialog.showMessageBox = async () => ({ response: 1 });
+  await handlers.uploadPaths(null, "test-bucket", "Overwrite/", [local]);
+  await waitFor(
+    () => objects.get("Overwrite/sample.txt").toString() === "verified upload",
+  );
+  await waitFor(
+    () =>
+      getState().transfers.find(
+        (transfer) => transfer.key === "Overwrite/sample.txt",
+      )?.status === "done",
+  );
+  checks.push(
+    "existing upload destinations require overwrite confirmation and cancellation preserves data",
+  );
   const largePath = path.join(temp, "upload-tests", "multipart.bin");
   await fs.writeFile(largePath, Buffer.alloc(17 * 1024 * 1024, 65));
   await uploadFile("test-bucket", "multipart.bin", largePath);

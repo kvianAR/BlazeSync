@@ -33,10 +33,14 @@ import {
   Lock,
   CircleCheck,
   CloudOff,
+  Wallet,
+  Pencil,
+  FolderInput,
 } from "lucide-react";
 import "./style.css";
 import "./quiet.css";
 import logo from "./logo.svg";
+import Billing from "./Billing.jsx";
 import { uniqueBy, refreshPages } from "./listing-data.mjs";
 const api = window.vault;
 const bytes = (n) => {
@@ -63,6 +67,13 @@ function App() {
     versionRequest = useRef(0),
     previewRequest = useRef(0);
   const [state, setState] = useState({ transfers: [], jobs: [], events: [] }),
+    [selected, setSelected] = useState([]),
+    [manageEntries, setManageEntries] = useState([]),
+    [manageMode, setManageMode] = useState("move"),
+    [newName, setNewName] = useState(""),
+    [destinationBucket, setDestinationBucket] = useState(""),
+    [destinationPrefix, setDestinationPrefix] = useState(""),
+    [managing, setManaging] = useState(false),
     [metrics, setMetrics] = useState(null),
     [metricsBusy, setMetricsBusy] = useState(false),
     [metricsError, setMetricsError] = useState(""),
@@ -262,6 +273,69 @@ function App() {
   const folders = [...new Set([...listing.folders, ...pendingFolders])].filter(
     (f) => f.slice(prefix.length).toLowerCase().includes(search.toLowerCase()),
   );
+  const selectedId = (entry) => (entry.folder ? "d:" : "f:") + entry.key;
+  const selectedIds = new Set(selected.map(selectedId));
+  const selectable = [
+    ...folders
+      .filter((key) => listing.folders.includes(key))
+      .map((key) => ({ key, folder: true })),
+    ...shown
+      .filter((file) => !file.transfer)
+      .map((file) => ({ key: file.key, folder: false })),
+  ];
+  const allSelected =
+    selectable.length > 0 &&
+    selectable.every((entry) => selectedIds.has(selectedId(entry)));
+  function toggleSelected(entry) {
+    setSelected((old) =>
+      old.some((value) => selectedId(value) === selectedId(entry))
+        ? old.filter((value) => selectedId(value) !== selectedId(entry))
+        : [...old, entry],
+    );
+  }
+  function openManage(mode) {
+    if (!selected.length) return;
+    setManageEntries([...selected]);
+    setManageMode(mode);
+    setNewName(selected[0].key.replace(/\/$/, "").split("/").pop());
+    setDestinationBucket(bucket);
+    setDestinationPrefix("");
+    setModal("manage");
+  }
+  async function submitManagement(event) {
+    event.preventDefault();
+    setManaging(true);
+    try {
+      const source = manageEntries[0].key.replace(/\/$/, "");
+      const parent = source.includes("/")
+        ? source.slice(0, source.lastIndexOf("/") + 1)
+        : "";
+      const result = await api.moveSelection(
+        bucket,
+        manageEntries,
+        manageMode === "rename" ? bucket : destinationBucket,
+        manageMode === "rename" ? parent : destinationPrefix,
+        manageMode === "rename" ? newName : undefined,
+      );
+      if (result) {
+        setModal(null);
+        setSelected([]);
+        setToast(
+          manageMode === "rename"
+            ? "Item renamed in Backblaze."
+            : "Selected items moved in Backblaze.",
+        );
+      }
+    } catch (failure) {
+      setError(failure.message);
+    } finally {
+      setManaging(false);
+    }
+  }
+  useEffect(
+    () => setSelected([]),
+    [bucket, prefix, fileView, state.connectionId],
+  );
   const versions = async (key, more = false, sourceBucket = bucket) => {
     const request = ++versionRequest.current;
     const r = await api.versions(
@@ -452,8 +526,9 @@ function App() {
       return;
     }
     act(async () => {
-      await api.uploadDropped(files, bucket, prefix);
-      setToast("Files queued in " + bucket + "/" + prefix);
+      const result = await api.uploadDropped(files, bucket, prefix);
+      if (result)
+        setToast(result.files + " files queued in " + bucket + "/" + prefix);
     });
   };
   return (
@@ -513,6 +588,7 @@ function App() {
             ["library", FileText, "Files"],
             ["photos", ImageIcon, "Photos"],
             ["backups", ShieldCheck, "Folder backups"],
+            ["billing", Wallet, "Storage & billing"],
             ["transfers", ArrowDownUp, "Transfers"],
             ["activity", History, "Activity"],
           ].map(([id, Icon, label]) => (
@@ -587,6 +663,7 @@ function App() {
                   transfers: "Transfers",
                   activity: "Activity",
                   settings: "Connection settings",
+                  billing: "Storage & billing",
                 }[page]
               }
             </b>
@@ -634,6 +711,16 @@ function App() {
               {toast}
             </div>
           )}
+          {state.fileOperation && (
+            <div className="info-strip" role="status">
+              <LoaderCircle size={18} className="spin" />
+              {state.fileOperation.label}
+              {state.fileOperation.total > 0
+                ? ` · ${state.fileOperation.completed}/${state.fileOperation.total}`
+                : ""}
+            </div>
+          )}
+          {page === "billing" && <Billing api={api} state={state} />}
           {page === "files" && (
             <>
               <div className="page-heading">
@@ -830,6 +917,68 @@ function App() {
                     </button>
                     <span>Backblaze B2 · {bucket}</span>
                   </div>
+                  {fileView === "current" && selected.length > 0 && (
+                    <div className="selection-bar">
+                      <b>{selected.length} selected</b>
+                      <button
+                        disabled={
+                          !!state.fileOperation || selected.length !== 1
+                        }
+                        onClick={() => openManage("rename")}
+                      >
+                        <Pencil size={15} />
+                        Rename
+                      </button>
+                      <button
+                        disabled={!!state.fileOperation}
+                        onClick={() => openManage("move")}
+                      >
+                        <FolderInput size={15} />
+                        Move
+                      </button>
+                      <button
+                        disabled={!!state.fileOperation}
+                        onClick={() =>
+                          act(async () => {
+                            const result = await api.downloadSelection(
+                              bucket,
+                              selected,
+                            );
+                            if (result) {
+                              setToast(
+                                `Queued ${result.files} files for download.`,
+                              );
+                              setSelected([]);
+                            }
+                          })
+                        }
+                      >
+                        <Download size={15} />
+                        Download
+                      </button>
+                      <button
+                        disabled={!!state.fileOperation}
+                        onClick={() =>
+                          act(async () => {
+                            const result = await api.removeSelection(
+                              bucket,
+                              selected,
+                            );
+                            if (result) {
+                              setToast(
+                                `Deleted ${result.deleted} current objects.`,
+                              );
+                              setSelected([]);
+                            }
+                          })
+                        }
+                      >
+                        <Trash2 size={15} />
+                        Delete
+                      </button>
+                      <button onClick={() => setSelected([])}>Clear</button>
+                    </div>
+                  )}
                   <div className="search-row">
                     <div className="search">
                       <Search size={17} />
@@ -957,7 +1106,18 @@ function App() {
                   ) : (
                     <div className="file-table">
                       <div className="table-head">
-                        <span>Name</span>
+                        <span className="selection-heading">
+                          <input
+                            className="item-select"
+                            type="checkbox"
+                            aria-label="Select all shown files and folders"
+                            checked={allSelected}
+                            onChange={() =>
+                              setSelected(allSelected ? [] : selectable)
+                            }
+                          />
+                          Name
+                        </span>
                         <span>Size</span>
                         <span>Last modified</span>
                         <span>Actions</span>
@@ -984,15 +1144,30 @@ function App() {
                           key={f}
                           onDoubleClick={() => setPrefix(f)}
                         >
-                          <button
-                            className="file-name"
-                            onClick={() => setPrefix(f)}
-                          >
-                            <span className="file-icon folder-icon">
-                              <Folder size={20} />
-                            </span>
-                            {f.slice(prefix.length).replace(/\/$/, "")}
-                          </button>
+                          <div className="file-name">
+                            <input
+                              className="item-select"
+                              type="checkbox"
+                              aria-label={"Select folder " + f}
+                              disabled={
+                                !listing.folders.includes(f) ||
+                                !!state.fileOperation
+                              }
+                              checked={selectedIds.has("d:" + f)}
+                              onChange={() =>
+                                toggleSelected({ key: f, folder: true })
+                              }
+                            />
+                            <button
+                              className="file-name"
+                              onClick={() => setPrefix(f)}
+                            >
+                              <span className="file-icon folder-icon">
+                                <Folder size={20} />
+                              </span>
+                              {f.slice(prefix.length).replace(/\/$/, "")}
+                            </button>
+                          </div>
                           <span
                             className="folder-size"
                             title={
@@ -1049,6 +1224,16 @@ function App() {
                       {shown.map((f) => (
                         <div className="file-row" key={f.key}>
                           <span className="file-name">
+                            <input
+                              className="item-select"
+                              type="checkbox"
+                              aria-label={"Select file " + f.key}
+                              disabled={!!f.transfer || !!state.fileOperation}
+                              checked={selectedIds.has("f:" + f.key)}
+                              onChange={() =>
+                                toggleSelected({ key: f.key, folder: false })
+                              }
+                            />
                             <span
                               className={
                                 "file-icon " +
@@ -1860,6 +2045,73 @@ function App() {
             <button className="close" onClick={closeModal}>
               <X size={20} />
             </button>
+            {modal === "manage" && (
+              <>
+                <h2>
+                  {manageMode === "rename"
+                    ? "Rename item"
+                    : "Move selected items"}
+                </h2>
+                <p>{manageEntries.map((entry) => entry.key).join(", ")}</p>
+                <form onSubmit={submitManagement}>
+                  {manageMode === "rename" ? (
+                    <label>
+                      New name
+                      <input
+                        autoFocus
+                        required
+                        value={newName}
+                        onChange={(event) => setNewName(event.target.value)}
+                      />
+                    </label>
+                  ) : (
+                    <>
+                      <label>
+                        Destination bucket
+                        <select
+                          value={destinationBucket}
+                          onChange={(event) =>
+                            setDestinationBucket(event.target.value)
+                          }
+                        >
+                          {buckets.map((item) => (
+                            <option key={item.Name} value={item.Name}>
+                              {item.Name}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <label>
+                        Destination folder path
+                        <input
+                          value={destinationPrefix}
+                          onChange={(event) =>
+                            setDestinationPrefix(event.target.value)
+                          }
+                          placeholder="Projects/2026/ · leave empty for bucket root"
+                        />
+                      </label>
+                    </>
+                  )}
+                  <p className="footnote">
+                    Copies are verified before sources are removed. Existing
+                    destination files require overwrite confirmation. Backblaze
+                    may retain older versions that continue using storage.
+                  </p>
+                  <button
+                    className="primary"
+                    disabled={managing || !!state.fileOperation}
+                  >
+                    {managing ? (
+                      <LoaderCircle size={16} className="spin" />
+                    ) : (
+                      <FolderInput size={16} />
+                    )}
+                    Review {manageMode === "rename" ? "rename" : "move"}
+                  </button>
+                </form>
+              </>
+            )}
             {modal === "folder" && (
               <>
                 <h2>A place for something new.</h2>
