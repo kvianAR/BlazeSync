@@ -1,0 +1,31 @@
+name: Bug report
+description: Report a reproducible problem without private account data.
+title: '[Bug] '
+body:
+  - type: markdown
+    attributes:
+      value: 'Remove keys, signed URLs and private data. For sensitive vulnerabilities, follow SECURITY.md.'
+  - type: input
+    id: versions
+    attributes:
+      label: App and macOS versions
+      placeholder: BlazeSync 0.3.0 / macOS version / Apple Silicon chip
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Expected and actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: error
+    attributes:
+      label: Sanitized error or screenshot
+      description: Never include Application Keys, private download links or sensitive filenames.
