@@ -1,0 +1,23 @@
+# Dependencies and generated builds
+node_modules/
+dist/
+work/
+outputs/
+coverage/
+assets/BlazeSync.iconset/
+assets/*preview.png
+assets/*menubar.png
+assets/smoke-result.json
+
+# Local state, secrets and diagnostics
+.env
+.env.*
+!.env.example
+vault.json
+preferences.json
+*.key
+*.pem
+*.log
+.DS_Store
+Thumbs.db
+third-party-notices/

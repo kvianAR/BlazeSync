@@ -1,0 +1,50 @@
+{
+  "name": "blazesync",
+  "version": "0.3.0",
+  "private": true,
+  "description": "A desktop file manager compatible with Backblaze B2 Cloud Storage.",
+  "main": "electron/main.cjs",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "vite build",
+    "start": "electron .",
+    "test": "node --test tests/*.test.cjs",
+    "package": "npm run build && node scripts/package.cjs",
+    "smoke": "electron . --smoke-test",
+    "update-app": "node scripts/update-app.cjs"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.922.0",
+    "@aws-sdk/lib-storage": "^3.922.0",
+    "@aws-sdk/s3-request-presigner": "^3.1161.0",
+    "@smithy/node-http-handler": "^4.14.1",
+    "lucide-react": "^0.468.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@electron/packager": "^20.3.0",
+    "electron": "^45.2.1",
+    "vite": "^6.0.0"
+  },
+  "productName": "BlazeSync",
+  "overrides": {
+    "@electron/asar": {
+      "glob": "^14.0.2",
+      "minimatch": "^11.0.1"
+    }
+  },
+  "license": "MIT",
+  "author": "kvianAR",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/kvianAR/BlazeSync.git"
+  },
+  "homepage": "https://github.com/kvianAR/BlazeSync#readme",
+  "bugs": {
+    "url": "https://github.com/kvianAR/BlazeSync/issues"
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  }
+}
