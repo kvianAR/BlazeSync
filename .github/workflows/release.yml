@@ -1,0 +1,42 @@
+name: Prepare draft release
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag (for example v0.3.0)
+        required: true
+        type: string
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: npm run package
+      - name: Create a draft for review
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          if ! [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo 'Use a version tag in vX.Y.Z format.' >&2
+            exit 1
+          fi
+          APP="$(cat work/packaged-path.txt)"
+          mkdir -p work/release
+          ditto -c -k --sequesterRsrc --keepParent "$APP" work/release/BlazeSync-macos-arm64.zip
+          (cd work/release && shasum -a 256 BlazeSync-macos-arm64.zip > SHA256SUMS.txt)
+          gh release create "$RELEASE_TAG" \
+            work/release/BlazeSync-macos-arm64.zip work/release/SHA256SUMS.txt \
+            --draft --verify-tag --title "BlazeSync $RELEASE_TAG" \
+            --notes-file "docs/releases/${RELEASE_TAG}.md"

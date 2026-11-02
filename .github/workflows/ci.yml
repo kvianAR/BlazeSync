@@ -1,0 +1,52 @@
+name: Build and tests
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  source:
+    name: Source checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+      - run: npm test
+      - run: npm run build
+      - run: npm audit --audit-level=moderate
+      - run: bash -n scripts/install-macos.sh
+  macos-package:
+    name: Signed Apple Silicon package
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - run: npm run package
+      - name: Verify package and prepare archive
+        shell: bash
+        run: |
+          APP="$(cat work/packaged-path.txt)"
+          codesign --verify --deep --strict "$APP"
+          mkdir -p work/release
+          ditto -c -k --sequesterRsrc --keepParent "$APP" work/release/BlazeSync-macos-arm64.zip
+          cd work/release
+          shasum -a 256 BlazeSync-macos-arm64.zip > SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BlazeSync-macos-arm64
+          path: |
+            work/release/BlazeSync-macos-arm64.zip
+            work/release/SHA256SUMS.txt
+          retention-days: 7
