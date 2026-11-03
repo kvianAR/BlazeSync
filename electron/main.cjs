@@ -67,6 +67,13 @@ const { FolderMetrics } = require("./folder-metrics.cjs");
 const folderMetrics = new FolderMetrics();
 const { scanStorage } = require("./billing.cjs");
 const {
+  hashFile,
+  unchangedFile,
+  syncArguments,
+  folderDestination,
+} = require("./folder-sync.cjs");
+const { servicePath, installFinderSync } = require("./finder-sync.cjs");
+const {
   BILLING_URL,
   validatePaymentDay,
   paymentReminder,
@@ -224,6 +231,7 @@ function publicState() {
     fileOperation,
     billingProgress,
     billingBudgetUsd: preferences.billingBudgetUsd || 0,
+    finderSyncInstalled: fs.existsSync(servicePath(app.getPath("home"))),
     billingPaymentDay: preferences.billingPaymentDay || 0,
     paymentReminder: paymentReminder(preferences.billingPaymentDay || 0),
     notificationsSupported: Notification.isSupported(),
@@ -412,6 +420,10 @@ async function uploadFile(bucket, key, file, directory = false, size = 0) {
           { abortSignal: abort.signal },
         );
       } else {
+        const hashing = new AbortController();
+        active.set(t.id, () => hashing.abort());
+        const contentHash = await hashFile(file, hashing.signal);
+        if (t.status === "cancelled") throw cancelled();
         uploader = new Upload({
           client: c,
           params: {
@@ -419,7 +431,10 @@ async function uploadFile(bucket, key, file, directory = false, size = 0) {
             Key: key,
             Body: fs.createReadStream(file),
             ContentLength: stat.size,
-            Metadata: { "vault-mtime": String(Math.trunc(stat.mtimeMs)) },
+            Metadata: {
+              "vault-mtime": String(Math.trunc(stat.mtimeMs)),
+              "blazesync-sha256": contentHash,
+            },
           },
           queueSize: 3,
           partSize: 8 * 1024 * 1024,
@@ -458,30 +473,68 @@ async function uploadFile(bucket, key, file, directory = false, size = 0) {
   uploadTail = result.catch(() => {});
   return result;
 }
+async function availableCopyKey(bucket, key) {
+  const extension = path.posix.extname(key);
+  const stem = extension ? key.slice(0, -extension.length) : key;
+  const copy =
+    stem + " (copy " + crypto.randomUUID().slice(0, 8) + ")" + extension;
+  try {
+    await getClient().send(
+      new HeadObjectCommand({ Bucket: bucket, Key: copy }),
+    );
+  } catch (error) {
+    if (error.$metadata?.httpStatusCode === 404 || error.name === "NotFound")
+      return copy;
+    throw error;
+  }
+  throw new Error("Copy name already exists. Try again.");
+}
 async function queuePaths(bucket, prefix, paths) {
   if (!bucket) throw new Error("Select an upload bucket first.");
   return withFileOperation(
     "Checking upload destination",
     async (sdk, progress) => {
       const entries = [];
-      for await (const entry of uploadEntries(paths, prefix))
-        entries.push(entry);
-      const conflicts = [];
-      let checked = 0;
+      for (const localPath of paths) {
+        if (typeof localPath !== "string" || !path.isAbsolute(localPath))
+          throw new Error("Choose a local file or folder.");
+        const stat = await fsp.lstat(localPath);
+        const destination = stat.isDirectory()
+          ? folderDestination(prefix, localPath)
+          : null;
+        const targetPrefix = destination
+          ? destination.slice(0, -path.basename(localPath).length - 1)
+          : prefix;
+        for await (const entry of uploadEntries([localPath], targetPrefix))
+          entries.push(entry);
+      }
+      const conflicts = [],
+        pending = [];
+      let checked = 0,
+        skipped = 0;
       for (const entry of entries) {
-        if (!entry.directory) {
-          try {
-            await sdk.send(
-              new HeadObjectCommand({ Bucket: bucket, Key: entry.key }),
-            );
-            conflicts.push(entry.key);
-          } catch (error) {
-            if (
-              error.$metadata?.httpStatusCode !== 404 &&
-              error.name !== "NotFound"
-            )
-              throw error;
-          }
+        blockBusyDelete(bucket, entry.key);
+        let head;
+        try {
+          head = await sdk.send(
+            new HeadObjectCommand({ Bucket: bucket, Key: entry.key }),
+          );
+        } catch (error) {
+          if (
+            error.$metadata?.httpStatusCode !== 404 &&
+            error.name !== "NotFound"
+          )
+            throw error;
+        }
+        const same = entry.directory
+          ? !!head
+          : head &&
+            (await unchangedFile(sdk, bucket, entry.key, entry.file, head));
+        entry.existing = !!head;
+        if (head && !entry.directory) conflicts.push(entry.key);
+        if (same) skipped++;
+        else {
+          pending.push(entry);
         }
         progress({
           stage: "checking",
@@ -493,19 +546,31 @@ async function queuePaths(bucket, prefix, paths) {
         showMain();
         const answer = await dialog.showMessageBox(win, {
           type: "warning",
-          message: "Replace existing cloud files?",
+          message: "Files with these names already exist",
           detail:
             conflicts.slice(0, 20).join("\n") +
             "\n" +
             conflicts.length +
-            " existing file(s) will get a new current version. Older versions may remain stored and billed.",
-          buttons: ["Cancel", "Replace current files"],
+            " existing file(s). Merge updates skips unchanged content and updates changed files. Keep both gives existing names a separate copy. Older cloud versions may remain stored and billed.",
+          buttons: ["Cancel", "Merge updates", "Keep both"],
           cancelId: 0,
           defaultId: 0,
         });
-        if (answer.response !== 1) return false;
+        if (answer.response === 0) return false;
+        if (answer.response === 2) {
+          pending.length = 0;
+          for (const entry of entries) {
+            if (entry.directory && entry.existing) continue;
+            pending.push(
+              entry.existing && !entry.directory
+                ? { ...entry, key: await availableCopyKey(bucket, entry.key) }
+                : entry,
+            );
+          }
+          skipped = entries.length - pending.length;
+        }
       }
-      for (const entry of entries)
+      for (const entry of pending)
         uploadFile(
           bucket,
           entry.key,
@@ -513,9 +578,10 @@ async function queuePaths(bucket, prefix, paths) {
           entry.directory,
           entry.size,
         ).catch(() => {});
-      const count = entries.filter((entry) => !entry.directory).length;
+      const count = pending.filter((entry) => !entry.directory).length;
       log("Queued " + count + " file(s) for " + bucket + "/" + prefix);
-      return { files: count };
+      log("Skipped " + skipped + " unchanged item(s)");
+      return { files: count, skipped };
     },
   );
 }
@@ -626,8 +692,109 @@ async function* walk(root) {
     else if (e.isFile()) yield p;
   }
 }
-async function runBackup(id) {
-  if (fileOperation) return;
+async function* jobEntries(job) {
+  if (job.kind === "sync") {
+    for await (const entry of uploadEntries([job.folder])) {
+      const relative = entry.key
+        .slice(path.basename(job.folder).length)
+        .replace(/^\//, "");
+      const sourceKey = job.prefix + relative;
+      yield { ...entry, sourceKey, key: job.targets?.[sourceKey] || sourceKey };
+    }
+  } else {
+    for await (const file of walk(job.folder)) {
+      const sourceKey = backupKey(job.prefix, job.folder, file);
+      yield { file, sourceKey, key: job.targets?.[sourceKey] || sourceKey };
+    }
+  }
+}
+async function registerSync(bucket, prefix, folder) {
+  return withFileOperation("Preparing folder sync", async () => {
+    getClient();
+    if (typeof folder !== "string" || !path.isAbsolute(folder))
+      throw new Error("Choose an absolute local folder.");
+    const stat = await fsp.lstat(folder);
+    if (!stat.isDirectory() || stat.isSymbolicLink())
+      throw new Error("Choose a local folder, without a symbolic link.");
+    folder = path.resolve(folder);
+    const destination = folderDestination(prefix, folder);
+    const existing = jobs.find(
+      (job) =>
+        job.kind === "sync" &&
+        job.folder === folder &&
+        job.bucket === bucket &&
+        job.prefix === destination &&
+        job.endpoint === connection.endpoint &&
+        job.keyId === connection.keyId,
+    );
+    if (existing) return existing;
+    const answer = await dialog.showMessageBox(win, {
+      type: "question",
+      message: "Sync this folder with Backblaze?",
+      detail:
+        folder +
+        "\nDestination: " +
+        bucket +
+        "/" +
+        destination +
+        "\nNew and changed local files will upload every 5 minutes while BlazeSync runs. Existing cloud files with the same names get updated versions.",
+      buttons: ["Cancel", "Enable folder sync"],
+      defaultId: 0,
+      cancelId: 0,
+    });
+    if (answer.response !== 1) return null;
+    const job = {
+      id: crypto.randomUUID(),
+      kind: "sync",
+      name: path.basename(folder),
+      folder,
+      bucket,
+      prefix: destination,
+      interval: 5,
+      enabled: true,
+      endpoint: connection.endpoint,
+      keyId: connection.keyId,
+    };
+    jobs.push(job);
+    persist();
+    emit();
+    return job;
+  });
+}
+async function syncFinderPaths(paths) {
+  showMain("backups");
+  getClient();
+  if (!paths.length) return;
+  for (const folder of paths) {
+    const existing = jobs.filter(
+      (job) =>
+        job.kind === "sync" &&
+        job.folder === folder &&
+        job.endpoint === connection.endpoint &&
+        job.keyId === connection.keyId,
+    );
+    if (existing.length > 1)
+      throw new Error(
+        "This folder has several sync destinations. Choose Sync now inside BlazeSync.",
+      );
+    let job = existing[0];
+    if (!job) {
+      const target = preferences.uploadTarget;
+      if (
+        !target ||
+        target.endpoint !== connection.endpoint ||
+        target.keyId !== connection.keyId
+      )
+        throw new Error(
+          "Choose the destination bucket and folder in BlazeSync first, then use Finder sync.",
+        );
+      job = await registerSync(target.bucket, target.prefix, folder);
+    }
+    if (job) await runBackup(job.id, true);
+  }
+}
+async function runBackup(id, interactive = false) {
+  assertNoFileOperation();
   const j = jobs.find((j) => j.id === id);
   if (!j || j.running) return;
   if (!client) throw new Error("Connect your B2 account first.");
@@ -635,6 +802,9 @@ async function runBackup(id) {
     throw new Error(
       "This backup belongs to another connection. Reconnect its original B2 key.",
     );
+  assertNoFileOperation();
+  if (jobs.some((job) => job.running))
+    throw new Error("Wait for the current folder sync to finish.");
   j.running = true;
   j.lastAttempt = Date.now();
   j.error = null;
@@ -643,30 +813,74 @@ async function runBackup(id) {
   try {
     persist();
     emit();
-    for await (const file of walk(j.folder)) {
-      if (!j.running) break;
-      const stat = await fsp.stat(file),
-        key = backupKey(j.prefix, j.folder, file);
-      let h;
+    const entries = [];
+    for await (const entry of jobEntries(j)) {
+      if (!j.running) throw cancelled();
+      blockBusyDelete(j.bucket, entry.key);
+      let head;
       try {
-        h = await getClient().send(
-          new HeadObjectCommand({ Bucket: j.bucket, Key: key }),
+        head = await getClient().send(
+          new HeadObjectCommand({ Bucket: j.bucket, Key: entry.key }),
         );
-      } catch (e) {
-        if (e.$metadata?.httpStatusCode !== 404) throw e;
+      } catch (error) {
+        if (
+          error.$metadata?.httpStatusCode !== 404 &&
+          error.name !== "NotFound"
+        )
+          throw error;
       }
-      if (
-        h &&
-        h.ContentLength === stat.size &&
-        h.Metadata?.["vault-mtime"] === String(Math.trunc(stat.mtimeMs))
-      ) {
+      const same = entry.directory
+        ? !!head
+        : head &&
+          (await unchangedFile(
+            getClient(),
+            j.bucket,
+            entry.key,
+            entry.file,
+            head,
+          ));
+      entries.push({ ...entry, existing: !!head, same });
+    }
+    let keepBoth = false;
+    const existing = entries.filter(
+      (entry) => !entry.directory && entry.existing,
+    );
+    if (interactive && existing.length) {
+      showMain("backups");
+      const answer = await dialog.showMessageBox(win, {
+        type: "question",
+        message: "How should existing files sync?",
+        detail:
+          existing.length +
+          " existing file(s). Merge updates uploads changed content and skips unchanged files. Keep both makes separate copies and uses those copies for future syncs.",
+        buttons: ["Cancel", "Merge updates", "Keep both"],
+        defaultId: 1,
+        cancelId: 0,
+      });
+      if (answer.response === 0) throw cancelled();
+      keepBoth = answer.response === 2;
+    }
+    for (const entry of entries) {
+      if (!j.running) throw cancelled();
+      const duplicate = keepBoth && entry.existing && !entry.directory;
+      if (entry.same && !duplicate) {
         skipped++;
         continue;
       }
-      await uploadFile(j.bucket, key, file);
+      const key = duplicate
+        ? await availableCopyKey(j.bucket, entry.key)
+        : entry.key;
+      if (duplicate) {
+        j.targets = { ...j.targets, [entry.sourceKey]: key };
+        persist();
+      }
+      await uploadFile(j.bucket, key, entry.file, entry.directory, entry.size);
       count++;
     }
+    if (!j.running) throw cancelled();
     j.lastSuccess = Date.now();
+    j.lastUploaded = count;
+    j.lastSkipped = skipped;
     log(`Backup finished: ${j.name} · ${count} uploaded, ${skipped} unchanged`);
   } catch (e) {
     j.error = e.message;
@@ -1490,6 +1704,31 @@ const handlers = {
     );
     cloudChanged();
   },
+  installFinderSync: async () => {
+    if (process.platform !== "darwin")
+      throw new Error("Finder sync requires macOS.");
+    const destination = await installFinderSync(
+      app.getPath("home"),
+      app.getPath("exe"),
+    );
+    emit();
+    return destination;
+  },
+  openSyncFolder: async (_, id) => {
+    const job = jobs.find((item) => item.id === id);
+    if (!job) throw new Error("Folder sync no longer exists.");
+    const failure = await shell.openPath(job.folder);
+    if (failure) throw new Error(failure);
+  },
+  addFolderSync: async (_, bucket, prefix) => {
+    const chosen = await dialog.showOpenDialog(win, {
+      properties: ["openDirectory"],
+    });
+    if (chosen.canceled) return null;
+    const job = await registerSync(bucket, prefix, chosen.filePaths[0]);
+    if (job) runBackup(job.id, true).catch((error) => log(error.message));
+    return job;
+  },
   addBackup: async (_, bucket, prefix, interval) => {
     getClient();
     if (![5, 60, 1440].includes(interval))
@@ -1522,9 +1761,7 @@ const handlers = {
     emit();
     return j;
   },
-  runBackup: (_, id) => {
-    runBackup(id).catch((e) => log(e.message));
-  },
+  runBackup: (_, id) => runBackup(id, true),
   toggleBackup: (_, id) => {
     const j = jobs.find((j) => j.id === id);
     if (j) {
@@ -1557,8 +1794,14 @@ if (smoke)
   );
 const primaryInstance = app.requestSingleInstanceLock();
 if (!primaryInstance) app.quit();
-app.on("second-instance", () => {
-  if (win) showMain();
+app.on("second-instance", (_, args) => {
+  const paths = syncArguments(args);
+  if (paths.length)
+    app
+      .whenReady()
+      .then(() => syncFinderPaths(paths))
+      .catch((error) => dropError(error));
+  else if (win) showMain();
 });
 app.whenReady().then(() => {
   if (!primaryInstance) return;
@@ -1700,6 +1943,11 @@ app.whenReady().then(() => {
       }
     });
   if (!smoke) {
+    const finderPaths = syncArguments(process.argv);
+    if (finderPaths.length)
+      win.webContents.once("did-finish-load", () =>
+        syncFinderPaths(finderPaths).catch((error) => dropError(error)),
+      );
     checkPaymentReminder();
     setInterval(checkPaymentReminder, 60000);
     powerMonitor.on("resume", checkPaymentReminder);
@@ -1710,14 +1958,16 @@ app.whenReady().then(() => {
     powerMonitor.on("unlock-screen", checkConnection);
   }
   setInterval(() => {
-    if (client)
+    if (client && !fileOperation && !jobs.some((job) => job.running))
       for (const j of jobs)
         if (
           due(j) &&
           j.endpoint === connection.endpoint &&
           j.keyId === connection.keyId
-        )
+        ) {
           runBackup(j.id).catch((e) => log(e.message));
+          break;
+        }
   }, 30000);
 });
 app.on("window-all-closed", () => {

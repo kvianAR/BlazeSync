@@ -528,7 +528,12 @@ function App() {
     act(async () => {
       const result = await api.uploadDropped(files, bucket, prefix);
       if (result)
-        setToast(result.files + " files queued in " + bucket + "/" + prefix);
+        setToast(
+          result.files +
+            " new/changed files queued · " +
+            (result.skipped || 0) +
+            " unchanged items skipped",
+        );
     });
   };
   return (
@@ -587,7 +592,7 @@ function App() {
             ["files", Folder, "All files"],
             ["library", FileText, "Files"],
             ["photos", ImageIcon, "Photos"],
-            ["backups", ShieldCheck, "Folder backups"],
+            ["backups", ShieldCheck, "Folder sync & backups"],
             ["billing", Wallet, "Storage & billing"],
             ["transfers", ArrowDownUp, "Transfers"],
             ["activity", History, "Activity"],
@@ -1908,6 +1913,34 @@ function App() {
                   <Plus size={17} />
                   Add folder backup
                 </button>
+                <button
+                  disabled={!bucket || !state.connected}
+                  onClick={() =>
+                    act(async () => {
+                      const job = await api.addFolderSync(bucket, prefix);
+                      if (job)
+                        setToast(
+                          "Folder sync enabled. New and changed files upload to the same destination.",
+                        );
+                    })
+                  }
+                >
+                  <RefreshCw size={17} /> Add folder sync
+                </button>
+                <button
+                  onClick={() =>
+                    act(async () => {
+                      await api.installFinderSync();
+                      setToast(
+                        "Finder Quick Action installed. Right-click a folder, then Services or Quick Actions → Sync with BlazeSync.",
+                      );
+                    })
+                  }
+                >
+                  {state.finderSyncInstalled
+                    ? "Refresh Finder sync"
+                    : "Enable Finder sync"}
+                </button>
               </div>
               <div className="info-strip">
                 <Clock size={18} />
@@ -1922,7 +1955,10 @@ function App() {
                         <Folder size={24} />
                       </div>
                       <div>
-                        <h2>{j.name}</h2>
+                        <h2>
+                          {j.name}
+                          {j.kind === "sync" ? " · Folder sync" : ""}
+                        </h2>
                         <p>{j.folder}</p>
                       </div>
                       <span className="pill">
@@ -1956,6 +1992,12 @@ function App() {
                         <p>{date(j.lastSuccess)}</p>
                       </div>
                     </div>
+                    {j.lastSuccess && (
+                      <p>
+                        {j.lastUploaded ?? 0} uploaded · {j.lastSkipped ?? 0}{" "}
+                        unchanged items skipped
+                      </p>
+                    )}
                     {j.error && <p className="error-text">{j.error}</p>}
                     <div className="form-actions">
                       <button
@@ -1963,7 +2005,12 @@ function App() {
                         onClick={() => act(() => api.runBackup(j.id))}
                       >
                         <Play size={15} />
-                        Run now
+                        {j.kind === "sync" ? "Sync now" : "Run now"}
+                      </button>
+                      <button
+                        onClick={() => act(() => api.openSyncFolder(j.id))}
+                      >
+                        Open local folder
                       </button>
                       <button onClick={() => act(() => api.toggleBackup(j.id))}>
                         {j.enabled ? <Pause size={15} /> : <Play size={15} />}{" "}
@@ -1996,9 +2043,10 @@ function App() {
                 </section>
               )}
               <p className="footnote">
-                Change detection uses size and modification time. Symlinks are
-                skipped. This is a file backup, not a full system snapshot.
-                Renamed files keep their older cloud copies.
+                Sync compares file content, including files uploaded before
+                content hashes were added. Symlinks are skipped. This is a file
+                backup, not a full system snapshot. Renamed files keep their
+                older cloud copies.
               </p>
             </>
           )}

@@ -237,7 +237,7 @@ module.exports = async function smoke(ctx) {
               .update(objects.get(key))
               .digest("hex") +
             '"';
-          if (metadata.has(key))
+          if (metadata.get(key) != null)
             extra["x-amz-meta-vault-mtime"] = metadata.get(key);
         }
       } else if (req.method === "DELETE") {
@@ -1017,6 +1017,82 @@ module.exports = async function smoke(ctx) {
   assert.equal(directoryResult.name, "AbortError");
   assert.equal(directoryTransfer.status, "cancelled");
   checks.push("cancelled directory-marker upload cannot revert to done");
+  const syncRoot = path.join(temp, "Sync demo");
+  await fs.mkdir(path.join(syncRoot, "nested", "empty"), { recursive: true });
+  await fs.writeFile(path.join(syncRoot, "code.txt"), "one");
+  dialog.showMessageBox = async () => ({ response: 1 });
+  dialog.showOpenDialog = async () => ({
+    canceled: false,
+    filePaths: [syncRoot],
+  });
+  const syncJob = await handlers.addFolderSync(null, "test-bucket", "Synced/");
+  await waitFor(() => !syncJob.running);
+  assert.equal(syncJob.kind, "sync");
+  assert.equal(objects.get("Synced/Sync demo/code.txt").toString(), "one");
+  assert.equal(objects.has("Synced/Sync demo/nested/empty/"), true);
+  const transferCount = getState().transfers.length;
+  await runBackup(syncJob.id);
+  assert.equal(getState().transfers.length, transferCount);
+  assert.equal(syncJob.error, null);
+  assert.equal(syncJob.lastUploaded, 0);
+  await fs.writeFile(path.join(syncRoot, "code.txt"), "two");
+  await fs.writeFile(path.join(syncRoot, "nested", "new.txt"), "new");
+  await runBackup(syncJob.id);
+  assert.equal(syncJob.lastUploaded, 2);
+  assert.equal(objects.get("Synced/Sync demo/code.txt").toString(), "two");
+  assert.equal(
+    objects.get("Synced/Sync demo/nested/new.txt").toString(),
+    "new",
+  );
+  const countBeforeDrop = getState().transfers.length;
+  dialog.showMessageBox = async () => ({ response: 1 });
+  const repeat = await handlers.uploadPaths(null, "test-bucket", "Synced/", [
+    syncRoot,
+  ]);
+  assert.equal(repeat.files, 0);
+  assert.ok(repeat.skipped > 0);
+  assert.equal(getState().transfers.length, countBeforeDrop);
+  const inside = await handlers.uploadPaths(
+    null,
+    "test-bucket",
+    "Synced/Sync demo/",
+    [syncRoot],
+  );
+  assert.equal(inside.files, 0);
+  assert.equal(objects.has("Synced/Sync demo/Sync demo/code.txt"), false);
+  dialog.showMessageBox = async () => ({ response: 2 });
+  await runBackup(syncJob.id, true);
+  assert.equal(syncJob.error, null);
+  const duplicateKey = syncJob.targets["Synced/Sync demo/code.txt"];
+  assert.ok(duplicateKey.includes("(copy "));
+  assert.equal(objects.get("Synced/Sync demo/code.txt").toString(), "two");
+  assert.equal(objects.get(duplicateKey).toString(), "two");
+  const afterCopies = getState().transfers.length;
+  await runBackup(syncJob.id);
+  assert.equal(getState().transfers.length, afterCopies);
+  await fs.writeFile(path.join(syncRoot, "code.txt"), "six");
+  await runBackup(syncJob.id);
+  assert.equal(objects.get(duplicateKey).toString(), "six");
+  assert.equal(objects.get("Synced/Sync demo/code.txt").toString(), "two");
+  dialog.showMessageBox = async () => ({ response: 1 });
+  checks.push(
+    "Keep both preserves original files and tracks copy destinations for future sync without repeated duplicates",
+  );
+  const sameJob = await handlers.addFolderSync(null, "test-bucket", "Synced/");
+  assert.equal(sameJob.id, syncJob.id);
+  await waitFor(() => !syncJob.running);
+  checks.push(
+    "folder sync skips unchanged content, merges same-size edits and new files, preserves empty folders and reuses destination",
+  );
+  checks.push("re-dropping a synced folder queues zero duplicate uploads");
+  await nav("backups");
+  assert.ok((await inspect("document.body.innerText")).includes("Sync now"));
+  assert.ok(
+    (await inspect("document.body.innerText")).includes("Enable Finder sync"),
+  );
+  checks.push(
+    "folder sync controls and Finder Quick Action installer appear in desktop UI",
+  );
   assert.equal(simulateLockedSave(), true);
   setTestConnection(connection, mock);
   checks.push(

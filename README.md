@@ -37,6 +37,7 @@ BlazeSync brings B2 files, folders, transfers, version history and one-way backu
 | **Accurate folder sizes** | See recursive current-file totals and per-folder file counts across all listing pages, not just the first 1,000 objects. |
 | **Transfers** | Follow queued/running/completed/failed/cancelled states, progress, estimated speed and remaining time. |
 | **Versions and deletion** | Separate current objects from stored versions and delete markers; restore supported versions or deliberately purge an exact file's history. |
+| **Folder sync** | Link a local folder to its existing B2 destination. Sync now or every five minutes. Manual sync/upload offers Merge updates or Keep both. Content comparison catches same-size code edits and skips unchanged files. Enable the Finder Sync with BlazeSync Quick Action from the app. |
 | **Folder backups** | Schedule one-way uploads of new/changed local files. Local deletion does not remove the cloud copy. |
 | **Photos** | Browse common image formats, including HEIC/RAW classification, and open supported original-image previews. |
 | **Private connection** | Enter just Key ID and Application Key. Endpoint and bucket discovery are automatic; saved credentials stay encrypted and locked. |
