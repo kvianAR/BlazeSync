@@ -17,7 +17,6 @@ const {
 const fs = require("node:fs");
 const fsp = fs.promises;
 const path = require("node:path");
-const { pipeline } = require("node:stream/promises");
 const {
   S3Client,
   ListBucketsCommand,
@@ -60,6 +59,7 @@ let win,
 const {
   uploadEntries,
   safeDownloadPath,
+  validateDownloadTargets,
   updateProgress,
   deleteError,
   cancelled,
@@ -73,9 +73,20 @@ const {
   diagnoseCloudError,
 } = require("./cloud-errors.cjs");
 const { prepareUploadPlan } = require("./upload-plan.cjs");
+const { consumeUploadBatch } = require("./upload-batch.cjs");
+const transferBatches = new Map();
+const { TransferPool } = require("./transfer-pool.cjs");
+const uploadPool = new TransferPool(12);
+const downloadPool = new TransferPool(4);
+const comparisonPool = new TransferPool(2);
+const { downloadObject } = require("./download.cjs");
+const { registerNativeIndex } = require("./native-file-index.cjs");
+const {
+  inspectUploadDestinations,
+  compareUploadContents,
+} = require("./upload-destination.cjs");
 const {
   hashFile,
-  unchangedFile,
   syncArguments,
   folderDestination,
 } = require("./folder-sync.cjs");
@@ -126,9 +137,7 @@ function connectionId() {
         .slice(0, 24)
     : null;
 }
-let uploadTail = Promise.resolve(),
-  downloadTail = Promise.resolve(),
-  revision = 0,
+let revision = 0,
   connectionEditing = false;
 let preferences = { theme: "dark", uploadTarget: null, refreshSeconds: 15 };
 const preferencesPath = () =>
@@ -138,11 +147,23 @@ function savePreferences() {
     mode: 0o600,
   });
 }
+let cloudRefreshTimer;
 function cloudChanged() {
   folderMetrics.invalidate();
   billingCache = null;
-  revision++;
-  emit();
+  if (active.size || transfers.some((t) => t.status === "queued")) {
+    if (!cloudRefreshTimer)
+      cloudRefreshTimer = setTimeout(() => {
+        cloudRefreshTimer = null;
+        revision++;
+        emit();
+      }, 5000);
+  } else {
+    clearTimeout(cloudRefreshTimer);
+    cloudRefreshTimer = null;
+    revision++;
+    emit();
+  }
 }
 let progressTimer;
 function progressEmit() {
@@ -233,6 +254,13 @@ function checkPaymentReminder() {
   }
 }
 function publicState() {
+  for (const context of transferBatches.values()) {
+    const batch = context.transfer;
+    if (batch.status === "running") {
+      const inFlight = [...context.current].reduce((total, item) => total + item.loaded, 0);
+      updateProgress(batch, context.completedBytes + inFlight);
+    }
+  }
   return {
     connected: !!client,
     fileOperation,
@@ -276,18 +304,32 @@ function publicState() {
     events,
   };
 }
+let stateTimer,
+  lastStateSent = 0,
+  lastTrayCount = -1;
 function emit() {
   if (isQuitting) return;
+  if (stateTimer) return;
+  const delay = Math.max(0, 200 - (Date.now() - lastStateSent));
+  if (delay) {
+    stateTimer = setTimeout(() => {
+      stateTimer = null;
+      emit();
+    }, delay);
+    return;
+  }
+  lastStateSent = Date.now();
+  const state = publicState();
   for (const w of [win, trayWindow])
     if (w && !w.isDestroyed())
-      w.webContents.send("vault:update", publicState());
-  if (tray && !tray.isDestroyed())
-    tray.setToolTip(
-      "BlazeSync · " +
-        transfers.filter((t) => ["queued", "running"].includes(t.status))
-          .length +
-        " active transfers",
-    );
+      w.webContents.send("vault:update", state);
+  const count = transfers.filter(
+    (t) => !t.batch && ["queued", "running"].includes(t.status),
+  ).length;
+  if (tray && !tray.isDestroyed() && count !== lastTrayCount) {
+    lastTrayCount = count;
+    tray.setToolTip("BlazeSync · " + count + " active transfers");
+  }
 }
 function log(message) {
   events.unshift({ id: crypto.randomUUID(), at: Date.now(), message });
@@ -318,6 +360,7 @@ function makeClient(c) {
     retryMode: "standard",
     maxAttempts: 5,
   });
+  registerNativeIndex(sdk, c);
   return configureCloudClient(sdk);
 }
 function configureCloudClient(sdk) {
@@ -399,7 +442,7 @@ async function checkConnection() {
     checkingConnection = false;
   }
 }
-function transfer(type, bucket, key, size = 0) {
+function transfer(type, bucket, key, size = 0, details = {}) {
   const t = {
     id: crypto.randomUUID(),
     type,
@@ -409,6 +452,7 @@ function transfer(type, bucket, key, size = 0) {
     loaded: 0,
     status: "queued",
     at: Date.now(),
+    ...details,
   };
   transfers.unshift(t);
   if (transfers.length > 300)
@@ -432,10 +476,11 @@ function fail(t, e) {
   t.error = t.status === "failed" ? e.message : undefined;
   emit();
 }
-async function uploadFile(bucket, key, file, directory = false, size = 0) {
+async function uploadFile(bucket, key, file, directory = false, size = 0, batch) {
   const t = transfer("upload", bucket, key, size);
   t.directory = directory;
-  const result = uploadTail.then(async () => {
+  if (batch) batch.current.add(t);
+  const result = uploadPool.schedule(async () => {
     let uploader;
     try {
       if (t.status === "cancelled") throw cancelled();
@@ -455,7 +500,15 @@ async function uploadFile(bucket, key, file, directory = false, size = 0) {
       } else {
         const hashing = new AbortController();
         active.set(t.id, () => hashing.abort());
-        const contentHash = await hashFile(file, hashing.signal);
+        t.phase = "hashing";
+        t.checked = 0;
+        const contentHash = await hashFile(file, hashing.signal, "sha256", (loaded) => {
+          t.checked = loaded;
+          progressEmit();
+        });
+        t.phase = "uploading";
+        t.startedAt = Date.now();
+        t.checked = stat.size;
         if (t.status === "cancelled") throw cancelled();
         uploader = new Upload({
           client: c,
@@ -496,14 +549,15 @@ async function uploadFile(bucket, key, file, directory = false, size = 0) {
       t.speed = 0;
       t.eta = 0;
       cloudChanged();
+      return t.size;
     } catch (error) {
       fail(t, error);
       throw error;
     } finally {
       active.delete(t.id);
+      batch?.current.delete(t);
     }
-  });
-  uploadTail = result.catch(() => {});
+  }, JSON.stringify([bucket, key]), directory || (size > 0 && size < 1024 * 1024) ? 1 : 3);
   return result;
 }
 async function availableCopyKey(bucket, key) {
@@ -522,8 +576,82 @@ async function availableCopyKey(bucket, key) {
   }
   throw new Error("Copy name already exists. Try again.");
 }
+function queueFileBatch(type, bucket, prefix, entries, runEntry) {
+  const controller = new AbortController();
+  const batch = transfer(
+    type, bucket, prefix || `${type} batch`,
+    entries.reduce((total, entry) => total + (entry.size || 0), 0),
+    { batch: true, directory: true, completed: 0, total: entries.length },
+  );
+  const context = {
+    type, bucket, transfer: batch, completedBytes: 0,
+    remaining: new Set(entries.map((entry) => entry.key)), current: new Set(),
+  };
+  transferBatches.set(batch.id, context);
+  async function stop(error) {
+    controller.abort(error);
+    await Promise.allSettled([...context.current].map(async (current) => {
+      if (["queued", "running"].includes(current.status)) {
+        current.status = "cancelled";
+        await active.get(current.id)?.();
+      }
+    }));
+  }
+  active.set(batch.id, () => stop(cancelled()));
+  batch.status = "running";
+  batch.startedAt = Date.now();
+  emit();
+  consumeUploadBatch(entries, async (entry) => {
+    let size = 0;
+    if (entry.checkExisting) {
+      await comparisonPool.schedule(() =>
+        compareUploadContents(getClient(), bucket, [entry], () => {}, controller.signal),
+      );
+      controller.signal.throwIfAborted();
+      if (entry.unchanged) batch.skipped = (batch.skipped || 0) + 1;
+      else size = await runEntry(entry, context);
+    } else size = await runEntry(entry, context);
+    context.remaining.delete(entry.key);
+    return size;
+  }, (progress) => {
+    batch.completed = progress.completed;
+    context.completedBytes = progress.loaded;
+    progressEmit();
+  }, controller.signal, { concurrency: type === "upload" ? 12 : 4, onError: stop })
+    .then(() => {
+      batch.status = "done";
+      batch.size = batch.loaded = context.completedBytes;
+      batch.speed = 0;
+      batch.eta = 0;
+    })
+    .catch((error) => {
+      fail(batch, error);
+      log(`${type} batch stopped after ${batch.completed}/${batch.total} items. ${error.message}`);
+    })
+    .finally(() => {
+      transferBatches.delete(batch.id);
+      active.delete(batch.id);
+      context.remaining.clear();
+      context.current.clear();
+      if (type === "upload") cloudChanged();
+      emit();
+    });
+  return batch;
+}
+function queueUploadBatch(bucket, prefix, entries) {
+  return queueFileBatch("upload", bucket, prefix, entries, async (entry, context) => {
+    return uploadFile(bucket, entry.key, entry.file, entry.directory, entry.size, context);
+  });
+}
+function queueDownloadBatch(bucket, root, entries) {
+  return queueFileBatch("download", bucket, root, entries, async (entry, context) => {
+    return downloadToFile(bucket, entry.key, entry.destination, root, entry.size, context);
+  });
+}
 async function queuePaths(bucket, prefix, paths) {
   if (!bucket) throw new Error("Select an upload bucket first.");
+  if ([...transferBatches.values()].some((batch) => batch.type === "upload"))
+    throw new Error("Finish or cancel the current upload batch before adding another upload.");
   return withFileOperation(
     "Checking upload destination",
     async (sdk, progress) => {
@@ -543,36 +671,19 @@ async function queuePaths(bucket, prefix, paths) {
       }
       const conflicts = new Set(),
         selectedNames = new Set();
-      let checked = 0,
-        keepBoth = false;
+      let keepBoth = false;
+      for (const entry of entries) blockBusyDelete(bucket, entry.key);
+      progress({
+        label: "Reading cloud folder listing",
+        stage: "listing",
+        completed: 0,
+        total: 0,
+      });
+      await inspectUploadDestinations(sdk, bucket, entries);
       for (const entry of entries) {
-        blockBusyDelete(bucket, entry.key);
-        let head;
-        try {
-          head = await sdk.send(
-            new HeadObjectCommand({ Bucket: bucket, Key: entry.key }),
-          );
-        } catch (error) {
-          if (
-            error.$metadata?.httpStatusCode !== 404 &&
-            error.name !== "NotFound"
-          )
-            throw error;
-        }
-        const same = entry.directory
-          ? !!head
-          : head &&
-            (await unchangedFile(sdk, bucket, entry.key, entry.file, head));
-        entry.existing = !!head;
-        entry.unchanged = !!same;
-        if (!entry.directory && (head || selectedNames.has(entry.key)))
+        if (!entry.directory && (entry.existing || selectedNames.has(entry.key)))
           conflicts.add(entry.key);
         selectedNames.add(entry.key);
-        progress({
-          stage: "checking",
-          completed: ++checked,
-          total: entries.length,
-        });
       }
       if (conflicts.size) {
         showMain();
@@ -591,19 +702,25 @@ async function queuePaths(bucket, prefix, paths) {
         if (answer.response === 0) return false;
         keepBoth = answer.response === 2;
       }
+      const streaming = entries.length > 32;
+      if (!keepBoth && !streaming) await compareUploadContents(sdk, bucket, entries, progress);
+      if (!keepBoth && streaming)
+        for (const entry of entries) entry.checkExisting = entry.existing && !entry.directory;
       const { pending, skipped, merged } = await prepareUploadPlan(
         entries,
         keepBoth,
         (key) => availableCopyKey(bucket, key),
       );
-      for (const entry of pending)
-        uploadFile(
-          bucket,
-          entry.key,
-          entry.file,
-          entry.directory,
-          entry.size,
-        ).catch(() => {});
+      if (streaming && pending.length) queueUploadBatch(bucket, prefix, pending);
+      else
+        for (const entry of pending)
+          uploadFile(
+            bucket,
+            entry.key,
+            entry.file,
+            entry.directory,
+            entry.size,
+          ).catch(() => {});
       const count = pending.filter((entry) => !entry.directory).length;
       log("Queued " + count + " file(s) for " + bucket + "/" + prefix);
       log("Skipped " + skipped + " unchanged item(s)");
@@ -617,11 +734,12 @@ async function queuePaths(bucket, prefix, paths) {
     },
   );
 }
-async function downloadToFile(bucket, key, destination, group = "") {
+async function downloadToFile(bucket, key, destination, group = "", size, batch) {
   const c = getClient(),
     t = transfer("download", bucket, key);
   t.group = group;
-  const result = downloadTail.then(async () => {
+  if (batch) batch.current.add(t);
+  const result = downloadPool.schedule(async () => {
     const abort = new AbortController();
     const temporary = destination + ".vault-" + t.id + ".part";
     try {
@@ -631,39 +749,38 @@ async function downloadToFile(bucket, key, destination, group = "") {
       t.startedAt = Date.now();
       emit();
       await fsp.mkdir(path.dirname(destination), { recursive: true });
-      const object = await c.send(
-        new GetObjectCommand({ Bucket: bucket, Key: key }),
-        { abortSignal: abort.signal },
-      );
-      t.size = object.ContentLength || 0;
-      object.Body.on("data", (chunk) => {
-        updateProgress(t, t.loaded + chunk.length);
-        progressEmit();
+      await downloadObject(c, { Bucket: bucket, Key: key }, temporary, {
+        size,
+        signal: abort.signal,
+        progress: (loaded, total) => {
+          t.size = total;
+          updateProgress(t, loaded);
+          progressEmit();
+        },
       });
-      await pipeline(
-        object.Body,
-        fs.createWriteStream(temporary, { flags: "wx" }),
-        { signal: abort.signal },
-      );
-      if (t.loaded !== t.size)
-        throw new Error("Download size verification failed");
       if (group) {
-        await fsp.copyFile(temporary, destination, fs.constants.COPYFILE_EXCL);
+        try {
+          await fsp.link(temporary, destination);
+        } catch (error) {
+          if (!["ENOTSUP", "EOPNOTSUPP", "EPERM", "EXDEV"].includes(error.code)) throw error;
+          await fsp.copyFile(temporary, destination, fs.constants.COPYFILE_EXCL);
+        }
         await fsp.rm(temporary);
       } else await fsp.rename(temporary, destination);
       t.status = "done";
       t.speed = 0;
       t.eta = 0;
       emit();
+      return t.size;
     } catch (error) {
       await fsp.rm(temporary, { force: true }).catch(() => {});
       fail(t, error);
       throw error;
     } finally {
       active.delete(t.id);
+      batch?.current.delete(t);
     }
-  });
-  downloadTail = result.catch(() => {});
+  }, destination);
   return result;
 }
 async function listTree(bucket, prefix) {
@@ -695,17 +812,16 @@ async function listTree(bucket, prefix) {
 }
 function blockBusyDelete(bucket, prefix, folder = false) {
   if (
-    transfers.some(
-      (t) =>
-        t.type === "upload" &&
-        t.bucket === bucket &&
-        ["queued", "running"].includes(t.status) &&
-        (folder ? t.key.startsWith(prefix) : t.key === prefix),
+    [...transferBatches.values()].some((batch) =>
+      batch.type === "upload" && batch.bucket === bucket &&
+      (folder ? [...batch.remaining].some((key) => key.startsWith(prefix)) : batch.remaining.has(prefix)),
+    ) || transfers.some((t) =>
+      !t.batch && t.type === "upload" && t.bucket === bucket &&
+      ["queued", "running"].includes(t.status) &&
+      (folder ? t.key.startsWith(prefix) : t.key === prefix),
     )
   )
-    throw new Error(
-      "An upload is still writing here. Finish or cancel it before deleting.",
-    );
+    throw new Error("An upload is still writing here. Finish or cancel it before deleting.");
 }
 async function deleteKey(bucket, key) {
   try {
@@ -736,7 +852,12 @@ async function* jobEntries(job) {
   } else {
     for await (const file of walk(job.folder)) {
       const sourceKey = backupKey(job.prefix, job.folder, file);
-      yield { file, sourceKey, key: job.targets?.[sourceKey] || sourceKey };
+      yield {
+        file,
+        size: (await fsp.stat(file)).size,
+        sourceKey,
+        key: job.targets?.[sourceKey] || sourceKey,
+      };
     }
   }
 }
@@ -853,30 +974,10 @@ async function runBackup(id, interactive = false) {
     for await (const entry of jobEntries(j)) {
       if (!j.running) throw cancelled();
       blockBusyDelete(j.bucket, entry.key);
-      let head;
-      try {
-        head = await getClient().send(
-          new HeadObjectCommand({ Bucket: j.bucket, Key: entry.key }),
-        );
-      } catch (error) {
-        if (
-          error.$metadata?.httpStatusCode !== 404 &&
-          error.name !== "NotFound"
-        )
-          throw error;
-      }
-      const same = entry.directory
-        ? !!head
-        : head &&
-          (await unchangedFile(
-            getClient(),
-            j.bucket,
-            entry.key,
-            entry.file,
-            head,
-          ));
-      entries.push({ ...entry, existing: !!head, same });
+      entries.push(entry);
     }
+    const sdk = getClient();
+    await inspectUploadDestinations(sdk, j.bucket, entries);
     let keepBoth = false;
     const existing = entries.filter(
       (entry) => !entry.directory && entry.existing,
@@ -896,23 +997,36 @@ async function runBackup(id, interactive = false) {
       if (answer.response === 0) throw cancelled();
       keepBoth = answer.response === 2;
     }
+    const pending = [];
+    const targets = { ...j.targets };
     for (const entry of entries) {
       if (!j.running) throw cancelled();
       const duplicate = keepBoth && entry.existing && !entry.directory;
-      if (entry.same && !duplicate) {
+      if (entry.unchanged && !duplicate) {
         skipped++;
         continue;
       }
-      const key = duplicate
-        ? await availableCopyKey(j.bucket, entry.key)
-        : entry.key;
-      if (duplicate) {
-        j.targets = { ...j.targets, [entry.sourceKey]: key };
-        persist();
-      }
-      await uploadFile(j.bucket, key, entry.file, entry.directory, entry.size);
-      count++;
+      const key = duplicate ? await availableCopyKey(j.bucket, entry.key) : entry.key;
+      if (duplicate) targets[entry.sourceKey] = key;
+      pending.push({ ...entry, key });
     }
+    if (keepBoth) {
+      j.targets = targets;
+      persist();
+    }
+    await consumeUploadBatch(pending, async (entry) => {
+      if (!j.running) throw cancelled();
+      if (!keepBoth && entry.existing && !entry.directory) {
+        await comparisonPool.schedule(() => compareUploadContents(sdk, j.bucket, [entry]));
+        if (entry.unchanged) {
+          skipped++;
+          return 0;
+        }
+      }
+      const size = await uploadFile(j.bucket, entry.key, entry.file, entry.directory, entry.size);
+      count++;
+      return size;
+    }, () => {}, new AbortController().signal, { concurrency: 12 });
     if (!j.running) throw cancelled();
     j.lastSuccess = Date.now();
     j.lastUploaded = count;
@@ -1183,37 +1297,23 @@ const handlers = {
       const files = destinations.filter(
         (item) => !item.object.key.endsWith("/"),
       );
-      for (const file of files) {
-        if (
-          destinations.some(
-            (item) =>
-              item !== file &&
-              item.destination.startsWith(file.destination + path.sep),
-          )
-        )
-          throw new Error(
-            "A selected file conflicts with a folder of the same name. Download them separately.",
-          );
-      }
+      validateDownloadTargets(root, destinations.map((item) => ({
+        destination: item.destination, directory: item.object.key.endsWith("/"),
+      })));
       await fsp.mkdir(root, { recursive: false });
       for (const item of destinations.filter((item) =>
         item.object.key.endsWith("/"),
       ))
         await fsp.mkdir(item.destination, { recursive: true });
-      const results = files.map((item) =>
-        downloadToFile(bucket, item.object.key, item.destination, root),
-      );
-      Promise.allSettled(results).then((values) => {
-        const failed = values.filter(
-          (value) => value.status === "rejected",
-        ).length;
-        log(
-          "Bulk download finished: " +
-            files.length +
-            " files, " +
-            failed +
-            " failed/cancelled.",
-        );
+      const downloadFiles = files.map((item) => ({
+        key: item.object.key, size: item.object.size, destination: item.destination,
+      }));
+      if (downloadFiles.length > 32) queueDownloadBatch(bucket, root, downloadFiles);
+      else Promise.allSettled(downloadFiles.map((entry) =>
+        downloadToFile(bucket, entry.key, entry.destination, root, entry.size),
+      )).then((values) => {
+        const failed = values.filter((value) => value.status === "rejected").length;
+        log(`Bulk download finished: ${downloadFiles.length} files, ${failed} failed/cancelled.`);
       });
       return { files: files.length, destination: root };
     }),
@@ -1535,13 +1635,13 @@ const handlers = {
     });
     if (!result.canceled) return queuePaths(bucket, prefix, result.filePaths);
   },
-  download: async (_, bucket, key) => {
+  download: async (_, bucket, key, size) => {
     getClient();
     const result = await dialog.showSaveDialog(win, {
       defaultPath: path.basename(key),
     });
     if (!result.canceled)
-      downloadToFile(bucket, key, result.filePath).catch(() => {});
+      downloadToFile(bucket, key, result.filePath, "", size).catch(() => {});
   },
   downloadFolder: async (_, bucket, prefix) => {
     getClient();
@@ -1565,30 +1665,24 @@ const handlers = {
       .map((object) => ({ object, relative: object.Key.slice(prefix.length) }))
       .filter((x) => x.relative)
       .map((x) => ({ ...x, destination: safeDownloadPath(root, x.relative) }));
+    validateDownloadTargets(root, destinations.map((item) => ({
+      destination: item.destination, directory: item.object.Key.endsWith("/"),
+    })));
     await fsp.mkdir(root, { recursive: false });
-    let count = 0;
-    const promises = [];
+    const files = [];
     for (const item of destinations) {
       if (item.object.Key.endsWith("/"))
         await fsp.mkdir(item.destination, { recursive: true });
-      else {
-        count++;
-        promises.push(
-          downloadToFile(bucket, item.object.Key, item.destination, root),
-        );
-      }
+      else files.push({ key: item.object.Key, destination: item.destination, size: item.object.Size });
     }
-    Promise.allSettled(promises).then((results) => {
-      const failed = results.filter((r) => r.status === "rejected").length;
-      log(
-        failed
-          ? "Folder download finished with " +
-              failed +
-              " failed/cancelled file(s). See Transfers."
-          : "Folder download complete: " + root,
-      );
+    const count = files.length;
+    if (count > 32) queueDownloadBatch(bucket, root, files);
+    else Promise.allSettled(files.map((entry) =>
+      downloadToFile(bucket, entry.key, entry.destination, root, entry.size),
+    )).then((results) => {
+      const failed = results.filter((result) => result.status === "rejected").length;
+      log(failed ? `Folder download finished with ${failed} failed/cancelled file(s). See Transfers.` : "Folder download complete: " + root);
     });
-    log("Queued complete folder: " + count + " file(s)");
     return { files: count, destination: root };
   },
   remove: async (_, bucket, key) => {
@@ -1972,6 +2066,8 @@ app.whenReady().then(() => {
           handlers,
           dialog,
           uploadFile,
+          queueUploadBatch,
+          uploadPool,
           runBackup,
           jobs,
           getState: publicState,
@@ -2049,6 +2145,8 @@ app.on("activate", () => {
 });
 app.on("will-quit", () => {
   isQuitting = true;
+  clearTimeout(stateTimer);
+  clearTimeout(cloudRefreshTimer);
   if (progressTimer) {
     clearTimeout(progressTimer);
     progressTimer = null;

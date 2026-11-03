@@ -158,3 +158,25 @@ test("invalid sizes and out-of-prefix results are rejected", async () => {
       /invalid|outside/,
     );
 });
+
+test("upload changes do not start overlapping folder-size scans", async () => {
+  const m = new FolderMetrics();
+  let calls = 0;
+  let release;
+  const client = { send: () => {
+    calls++;
+    return new Promise((resolve) => { release = resolve; });
+  } };
+  const first = m.read(client, "bucket");
+  m.invalidate();
+  const second = m.read(client, "bucket", "", true);
+  m.invalidate();
+  const third = m.read(client, "bucket", "", true);
+  assert.equal(calls, 1);
+  release({ Contents: [item("file", 5)] });
+  await Promise.all([first, second, third]);
+  const refreshed = m.read(client, "bucket");
+  assert.equal(calls, 2, "an invalidated scan must not become a cached final size");
+  release({ Contents: [item("file", 10)] });
+  assert.equal((await refreshed).bytes, 10);
+});

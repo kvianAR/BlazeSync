@@ -18,6 +18,9 @@ function context(extra = {}) {
     trayWindow: null,
     publicState: () => ({}),
     transfers: [],
+    stateTimer: null,
+    lastStateSent: 0,
+    lastTrayCount: -1,
     ...extra,
   });
 }
@@ -72,4 +75,32 @@ test("a scheduled progress timer remains safe if shutdown destroys tray before i
   vm.runInContext("progressEmit();isQuitting=true;", c);
   assert.doesNotThrow(() => callback());
   assert.equal(c.progressTimer, null);
+});
+
+
+test("50,000 state changes send one bounded update per window per 200ms", () => {
+  let now = 1000;
+  let scheduled;
+  let snapshots = 0;
+  let sends = 0;
+  const window = {
+    isDestroyed: () => false,
+    webContents: { send: () => sends++ },
+  };
+  const c = context({
+    Date: { now: () => now },
+    win: window,
+    trayWindow: window,
+    tray: null,
+    publicState: () => { snapshots++; return {}; },
+    setTimeout: (callback) => { scheduled = callback; return 1; },
+  });
+  vm.runInContext(emitter, c);
+  vm.runInContext("for (let i = 0; i < 50000; i++) emit();", c);
+  assert.equal(snapshots, 1);
+  assert.equal(sends, 2);
+  now += 200;
+  scheduled();
+  assert.equal(snapshots, 2);
+  assert.equal(sends, 4);
 });

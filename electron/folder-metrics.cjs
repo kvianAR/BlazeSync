@@ -21,7 +21,7 @@ class FolderMetrics {
     )
       return cached.value;
     const existing = this.pending.get(key);
-    if (existing?.client === client && existing.generation === generation)
+    if (existing?.client === client)
       return existing.promise;
     const entry = { client, generation };
     entry.promise = (async () => {

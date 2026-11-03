@@ -240,11 +240,12 @@ function App() {
     }
   }, [toast]);
   const active = state.transfers.filter((t) =>
-    ["running", "queued"].includes(t.status),
+    !t.batch && ["running", "queued"].includes(t.status),
   ).length;
   const pending = state.transfers.filter(
     (t) =>
       t.type === "upload" &&
+      !t.batch &&
       t.bucket === bucket &&
       ["queued", "running"].includes(t.status),
   );
@@ -1297,7 +1298,7 @@ function App() {
                               title="Download"
                               disabled={!!f.transfer}
                               onClick={() =>
-                                act(() => api.download(bucket, f.key))
+                                act(() => api.download(bucket, f.key, f.size))
                               }
                             >
                               <Download size={15} />
@@ -1513,7 +1514,7 @@ function App() {
                               <button
                                 title="Download original"
                                 onClick={() =>
-                                  act(() => api.download(bucket, f.key))
+                                  act(() => api.download(bucket, f.key, f.size))
                                 }
                               >
                                 <Download size={15} />
@@ -1551,7 +1552,7 @@ function App() {
                             <button
                               title="Download"
                               onClick={() =>
-                                act(() => api.download(bucket, f.key))
+                                act(() => api.download(bucket, f.key, f.size))
                               }
                             >
                               <Download size={15} />
@@ -1854,6 +1855,9 @@ function App() {
                         <b>{t.key}</b>
                         <small>
                           {t.bucket} · {t.type} · {t.error || t.status}
+                          {t.batch && ` · ${t.completed}/${t.total} items`}
+                          {t.batch && t.skipped > 0 && ` · ${t.skipped} unchanged`}
+                          {t.phase === "hashing" && ` · Checking local file ${bytes(t.checked || 0)} / ${bytes(t.size)}`}
                         </small>
                         <div className="progress">
                           <i
@@ -1878,7 +1882,7 @@ function App() {
                       </span>
                       {["queued", "running"].includes(t.status) ? (
                         <button
-                          title="Cancel"
+                          title={t.batch ? "Cancel entire transfer batch" : "Cancel"}
                           onClick={() => act(() => api.cancel(t.id))}
                         >
                           <X size={18} />
@@ -2272,7 +2276,7 @@ function App() {
                 <button
                   className="primary"
                   onClick={() =>
-                    act(() => api.download(previewFile.bucket, previewFile.key))
+                    act(() => api.download(previewFile.bucket, previewFile.key, previewFile.size))
                   }
                 >
                   <Download size={16} />

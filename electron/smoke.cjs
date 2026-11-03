@@ -22,6 +22,8 @@ module.exports = async function smoke(ctx) {
     handlers,
     dialog,
     uploadFile,
+    queueUploadBatch,
+    uploadPool,
     runBackup,
     jobs,
     getState,
@@ -57,14 +59,9 @@ module.exports = async function smoke(ctx) {
   await sleep(150);
   assert.equal(await inspect('document.querySelectorAll("input").length'), 2);
   await handlers.setTheme(null, "dark");
-  await sleep(100);
-  assert.equal(await inspect("document.documentElement.dataset.theme"), "dark");
+  await waitFor(async () => (await inspect("document.documentElement.dataset.theme")) === "dark");
   await handlers.setTheme(null, "light");
-  await sleep(100);
-  assert.equal(
-    await inspect("document.documentElement.dataset.theme"),
-    "light",
-  );
+  await waitFor(async () => (await inspect("document.documentElement.dataset.theme")) === "light");
   await handlers.setTheme(null, "dark");
   checks.push("dark/light mode and synchronized theme");
   checks.push("connection form");
@@ -350,6 +347,12 @@ module.exports = async function smoke(ctx) {
           "</ListBucketResult>";
       } else if (objects.has(key)) {
         body = objects.get(key);
+        if (headers.range) {
+          const [, start, end] = headers.range.match(/bytes=(\d+)-(\d+)/);
+          extra["content-range"] = `bytes ${start}-${end}/${body.length}`;
+          body = body.subarray(Number(start), Number(end) + 1);
+          statusCode = 206;
+        }
         extra["content-length"] = String(body.length);
       } else {
         body =
@@ -568,6 +571,10 @@ module.exports = async function smoke(ctx) {
     false,
   );
   checks.push("confirmed folder deletion removes exact folder prefix");
+  const slotReleases = [];
+  const occupiedSlots = Array.from({ length: 9 }, () => uploadPool.schedule(() =>
+    new Promise((resolve) => slotReleases.push(resolve)),
+  ));
   blockedKey = "hold.txt";
   const held = uploadFile("test-bucket", "hold.txt", local);
   await waitFor(() => !!releaseUpload);
@@ -635,6 +642,8 @@ module.exports = async function smoke(ctx) {
   releaseUpload();
   await holdBackup;
   await backupRun;
+  slotReleases.forEach((release) => release());
+  await Promise.all(occupiedSlots);
   assert.equal(job.lastSuccess, lastSuccess);
   assert.match(job.error, /cancel/i);
   checks.push(
@@ -1294,6 +1303,87 @@ module.exports = async function smoke(ctx) {
   checks.push(
     "saving backup state during a locked connection preserves the encrypted pending key",
   );
+  // Exercise the production batch scheduler and renderer using disposable fixture data.
+  await nav("transfers");
+  const bulkEntries = Array.from({ length: 128 }, (_, index) => ({
+    key: `Load-check/file-${index}.txt`, file: local, size: 15,
+  }));
+  const bulkRoot = path.join(temp, "Load-check");
+  await fs.mkdir(bulkRoot);
+  for (const entry of bulkEntries)
+    await fs.writeFile(path.join(bulkRoot, path.basename(entry.key)), "verified upload");
+  let peakActive = 0;
+  let peakRows = 0;
+  let heartbeats = 0;
+  const rssBefore = process.memoryUsage().rss;
+  let peakRss = rssBefore;
+  const heartbeat = setInterval(() => {
+    heartbeats++;
+    const current = getState().transfers;
+    peakActive = Math.max(peakActive, current.filter((item) =>
+      !item.batch && ["queued", "running"].includes(item.status),
+    ).length);
+    peakRows = Math.max(peakRows, current.length);
+    peakRss = Math.max(peakRss, process.memoryUsage().rss);
+  }, 10);
+  const queued = await handlers.uploadPaths(null, "test-bucket", "", [bulkRoot]);
+  assert.equal(queued.files, 128);
+  const batch = getState().transfers.find((item) => item.batch && item.status === "running");
+  assert.ok(batch);
+  assert.ok(getState().transfers.filter((item) =>
+    ["queued", "running"].includes(item.status),
+  ).length <= 13);
+  await assert.rejects(handlers.disconnect(), /cancel transfers/);
+  await assert.rejects(handlers.remove(null, "test-bucket", bulkEntries[100].key), /upload is still writing/);
+  try {
+    for (let attempt = 0; attempt < 600 && batch.status === "running"; attempt++) {
+      await sleep(25);
+    }
+    assert.equal(batch.status, "done", batch.error);
+    assert.equal(batch.completed, 129);
+    assert.ok(heartbeats > 0);
+    assert.ok(peakActive <= 12);
+    assert.ok(peakRows <= 300);
+    await waitFor(async () =>
+      (await inspect("document.body.innerText")).includes("129/129 items"),
+    );
+  } finally {
+    clearInterval(heartbeat);
+  }
+  const repeatBulk = await handlers.uploadPaths(null, "test-bucket", "", [bulkRoot]);
+  assert.equal(repeatBulk.files, 128);
+  const checkingBatch = getState().transfers.find((item) => item.batch && item.type === "upload" && item.status === "running");
+  assert.ok(checkingBatch, "existing content is compared inside the batch, after queueing");
+  for (let attempt = 0; attempt < 600 && checkingBatch.status === "running"; attempt++) await sleep(25);
+  assert.equal(checkingBatch.status, "done", checkingBatch.error);
+  assert.equal(checkingBatch.skipped, 128);
+  checks.push("repeated large folders queue immediately and compare unchanged content inside the batch");
+  const savedDownloadDialog = dialog.showOpenDialog;
+  dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [temp] });
+  const bulkDownload = await handlers.downloadFolder(null, "test-bucket", "Load-check/");
+  const downloadingBatch = getState().transfers.find((item) => item.batch && item.type === "download" && item.status === "running");
+  assert.ok(downloadingBatch);
+  for (let attempt = 0; attempt < 600 && downloadingBatch.status === "running"; attempt++) await sleep(25);
+  assert.equal(downloadingBatch.status, "done", downloadingBatch.error);
+  assert.equal(await fs.readFile(path.join(bulkDownload.destination, "file-127.txt"), "utf8"), "verified upload");
+  dialog.showOpenDialog = savedDownloadDialog;
+  checks.push("folder downloads use bounded parallel batches through the normal download entry point");
+  const cancelledBatch = queueUploadBatch("test-bucket", "Cancel-load/", bulkEntries.map((entry) => ({
+    ...entry, key: entry.key.replace("Load-check/", "Cancel-load/"),
+  })));
+  await handlers.cancel(null, cancelledBatch.id);
+  await waitFor(() => !getState().transfers.some((item) =>
+    ["queued", "running"].includes(item.status),
+  ));
+  assert.equal(cancelledBatch.status, "cancelled");
+  assert.equal([...objects.keys()].filter((key) => key.startsWith("Cancel-load/")).length, 0);
+  await fs.writeFile(path.join(outputDir, "upload-load-result.json"), JSON.stringify({
+    files: 128, peakActive, peakRows, heartbeats,
+    rssGrowthMB: Math.round((peakRss - rssBefore) / 1024 / 1024),
+    cloud: "Local fixture only",
+  }, null, 2));
+  checks.push("large upload batches bound active work and transfer history while keeping the UI responsive");
+  checks.push("batch cancellation stops unstarted uploads and pending targets remain protected");
   const result = {
     passed: true,
     checks,

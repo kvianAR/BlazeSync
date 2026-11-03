@@ -23,6 +23,17 @@ async function* uploadEntries(paths, prefix = "") {
     yield* visit(file, joinKey(prefix, path.basename(file)));
   }
 }
+function validateDownloadTargets(root, entries) {
+  const files = new Set(entries.filter((entry) => !entry.directory).map((entry) => entry.destination));
+  for (const entry of entries) {
+    let parent = entry.directory ? entry.destination : path.dirname(entry.destination);
+    while (parent !== root && parent.startsWith(root + path.sep)) {
+      if (files.has(parent))
+        throw new Error("A selected file conflicts with a folder of the same name. Download them separately.");
+      parent = path.dirname(parent);
+    }
+  }
+}
 function safeDownloadPath(root, relative) {
   const parts = relative.replace(/\/$/, "").split("/");
   if (
@@ -70,6 +81,7 @@ function cancelled() {
 module.exports = {
   uploadEntries,
   safeDownloadPath,
+  validateDownloadTargets,
   updateProgress,
   deleteError,
   cancelled,
