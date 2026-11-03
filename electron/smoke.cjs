@@ -134,6 +134,10 @@ module.exports = async function smoke(ctx) {
     },
   ];
   let denyDeletion = false;
+  let blockedVersions = false,
+    releaseVersions = null;
+  let blockedDelete = null,
+    releaseDeletion = null;
   const multipart = new Map();
   let multipartStarted = 0,
     multipartFinished = 0;
@@ -241,6 +245,10 @@ module.exports = async function smoke(ctx) {
             extra["x-amz-meta-vault-mtime"] = metadata.get(key);
         }
       } else if (req.method === "DELETE") {
+        if (blockedDelete === key)
+          await new Promise((resolve) => {
+            releaseDeletion = resolve;
+          });
         if (denyDeletion)
           return {
             response: {
@@ -264,6 +272,10 @@ module.exports = async function smoke(ctx) {
         body =
           "<ListMultipartUploadsResult><IsTruncated>false</IsTruncated></ListMultipartUploadsResult>";
       } else if ("versions" in q) {
+        if (blockedVersions)
+          await new Promise((resolve) => {
+            releaseVersions = resolve;
+          });
         const hidden = hiddenHistory.filter((v) =>
           v.key.startsWith(q.prefix || ""),
         );
@@ -1088,10 +1100,147 @@ module.exports = async function smoke(ctx) {
   await nav("backups");
   assert.ok((await inspect("document.body.innerText")).includes("Sync now"));
   assert.ok(
-    (await inspect("document.body.innerText")).includes("Enable Finder sync"),
+    (await inspect("document.body.innerText")).includes(
+      getState().finderSyncInstalled
+        ? "Refresh Finder sync"
+        : "Enable Finder sync",
+    ),
   );
   checks.push(
     "folder sync controls and Finder Quick Action installer appear in desktop UI",
+  );
+  const collisionA = path.join(temp, "collision-a", "same.txt");
+  const collisionB = path.join(temp, "collision-b", "same.txt");
+  await fs.mkdir(path.dirname(collisionA), { recursive: true });
+  await fs.mkdir(path.dirname(collisionB), { recursive: true });
+  await fs.writeFile(collisionA, "first");
+  await fs.writeFile(collisionB, "second");
+  dialog.showMessageBox = async () => ({ response: 0 });
+  assert.equal(
+    await handlers.uploadPaths(null, "test-bucket", "Collision/", [
+      collisionA,
+      collisionB,
+    ]),
+    false,
+  );
+  assert.equal(objects.has("Collision/same.txt"), false);
+  dialog.showMessageBox = async () => ({ response: 1 });
+  const merged = await handlers.uploadPaths(null, "test-bucket", "Collision/", [
+    collisionA,
+    collisionB,
+  ]);
+  assert.equal(merged.files, 1);
+  assert.equal(merged.merged, 1);
+  await waitFor(
+    () => objects.get("Collision/same.txt")?.toString() === "second",
+  );
+  await waitFor(
+    () =>
+      getState().transfers.filter((item) =>
+        ["queued", "running"].includes(item.status),
+      ).length === 0,
+  );
+  objects.delete("Collision/same.txt");
+  dialog.showMessageBox = async () => ({ response: 2 });
+  const copied = await handlers.uploadPaths(null, "test-bucket", "Collision/", [
+    collisionA,
+    collisionB,
+  ]);
+  assert.equal(copied.files, 2);
+  await waitFor(
+    () =>
+      getState().transfers.filter((item) =>
+        ["queued", "running"].includes(item.status),
+      ).length === 0,
+  );
+  assert.deepEqual(
+    [...objects]
+      .filter(([key]) => key.startsWith("Collision/"))
+      .map(([, value]) => value.toString())
+      .sort(),
+    ["first", "second"],
+  );
+  checks.push(
+    "same-name files from different local folders require a choice and preserve both contents when requested",
+  );
+  const successBeforeRootChange = syncJob.lastSuccess;
+  await fs.rename(syncRoot, syncRoot + "-moved");
+  await fs.symlink(syncRoot + "-moved", syncRoot, "dir");
+  await runBackup(syncJob.id);
+  assert.match(syncJob.error, /linked local folder was replaced/);
+  assert.equal(syncJob.lastSuccess, successBeforeRootChange);
+  await fs.unlink(syncRoot);
+  await fs.rename(syncRoot + "-moved", syncRoot);
+  checks.push(
+    "replaced or symbolic-link sync roots fail clearly without reporting false success",
+  );
+  dialog.showMessageBox = async () => ({ response: 1 });
+  objects.set("review-delete.txt", Buffer.from("disposable"));
+  blockedDelete = "review-delete.txt";
+  const deleting = handlers.remove(null, "test-bucket", blockedDelete);
+  await waitFor(() => !!releaseDeletion);
+  assert.ok(getState().fileOperation);
+  await assert.rejects(runBackup(syncJob.id), /current file operation/);
+  await assert.rejects(
+    handlers.uploadPaths(null, "test-bucket", "", [collisionA]),
+    /current file operation/,
+  );
+  releaseDeletion();
+  await deleting;
+  blockedDelete = null;
+  assert.equal(objects.has("review-delete.txt"), false);
+  checks.push(
+    "legacy delete holds the management lock and blocks concurrent sync or upload preparation",
+  );
+  objects.set("review-account.txt", Buffer.from("keep"));
+  let approveAccountDelete;
+  dialog.showMessageBox = () =>
+    new Promise((resolve) => {
+      approveAccountDelete = resolve;
+    });
+  const changedAccountDelete = handlers.remove(
+    null,
+    "test-bucket",
+    "review-account.txt",
+  );
+  await waitFor(() => !!approveAccountDelete);
+  setTestConnection({ ...connection, keyId: "another-test-account" }, mock);
+  approveAccountDelete({ response: 1 });
+  await assert.rejects(changedAccountDelete, /Connection changed/);
+  assert.equal(objects.has("review-account.txt"), true);
+  setTestConnection(connection, mock);
+  dialog.showMessageBox = async () => ({ response: 1 });
+  checks.push(
+    "account switching while a confirmation is open cannot apply deletion to a different account",
+  );
+  releaseUpload = null;
+  blockedKey = "Photos/sunset.JPG";
+  const writingRestoreTarget = uploadFile("test-bucket", blockedKey, local);
+  await waitFor(() => !!releaseUpload);
+  await assert.rejects(
+    handlers.restore(null, "test-bucket", blockedKey, "old+/="),
+    /upload is still writing/,
+  );
+  releaseUpload();
+  await writingRestoreTarget;
+  blockedKey = null;
+  checks.push(
+    "version restore refuses to race an upload writing the same target",
+  );
+  blockedVersions = true;
+  const changingBilling = handlers.billing(null, true);
+  await waitFor(() => !!releaseVersions);
+  setTestConnection({ ...connection, keyId: "changed-during-billing" }, mock);
+  releaseVersions();
+  blockedVersions = false;
+  await assert.rejects(
+    changingBilling,
+    /Connection changed during billing scan/,
+  );
+  assert.equal(getState().billingProgress, null);
+  setTestConnection(connection, mock);
+  checks.push(
+    "account changes reject stale billing results and clear their progress indicator",
   );
   assert.equal(simulateLockedSave(), true);
   setTestConnection(connection, mock);

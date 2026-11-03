@@ -66,6 +66,7 @@ const {
 const { FolderMetrics } = require("./folder-metrics.cjs");
 const folderMetrics = new FolderMetrics();
 const { scanStorage } = require("./billing.cjs");
+const { prepareUploadPlan } = require("./upload-plan.cjs");
 const {
   hashFile,
   unchangedFile,
@@ -508,10 +509,10 @@ async function queuePaths(bucket, prefix, paths) {
         for await (const entry of uploadEntries([localPath], targetPrefix))
           entries.push(entry);
       }
-      const conflicts = [],
-        pending = [];
+      const conflicts = new Set(),
+        selectedNames = new Set();
       let checked = 0,
-        skipped = 0;
+        keepBoth = false;
       for (const entry of entries) {
         blockBusyDelete(bucket, entry.key);
         let head;
@@ -531,45 +532,38 @@ async function queuePaths(bucket, prefix, paths) {
           : head &&
             (await unchangedFile(sdk, bucket, entry.key, entry.file, head));
         entry.existing = !!head;
-        if (head && !entry.directory) conflicts.push(entry.key);
-        if (same) skipped++;
-        else {
-          pending.push(entry);
-        }
+        entry.unchanged = !!same;
+        if (!entry.directory && (head || selectedNames.has(entry.key)))
+          conflicts.add(entry.key);
+        selectedNames.add(entry.key);
         progress({
           stage: "checking",
           completed: ++checked,
           total: entries.length,
         });
       }
-      if (conflicts.length) {
+      if (conflicts.size) {
         showMain();
         const answer = await dialog.showMessageBox(win, {
           type: "warning",
           message: "Files with these names already exist",
           detail:
-            conflicts.slice(0, 20).join("\n") +
+            [...conflicts].slice(0, 20).join("\n") +
             "\n" +
-            conflicts.length +
-            " existing file(s). Merge updates skips unchanged content and updates changed files. Keep both gives existing names a separate copy. Older cloud versions may remain stored and billed.",
+            conflicts.size +
+            " repeated destination name(s). Merge updates skips unchanged content and updates changed files. For multiple selected sources with the same destination, the last selected source wins. Keep both preserves separate copies. Older cloud versions may remain stored and billed.",
           buttons: ["Cancel", "Merge updates", "Keep both"],
           cancelId: 0,
           defaultId: 0,
         });
         if (answer.response === 0) return false;
-        if (answer.response === 2) {
-          pending.length = 0;
-          for (const entry of entries) {
-            if (entry.directory && entry.existing) continue;
-            pending.push(
-              entry.existing && !entry.directory
-                ? { ...entry, key: await availableCopyKey(bucket, entry.key) }
-                : entry,
-            );
-          }
-          skipped = entries.length - pending.length;
-        }
+        keepBoth = answer.response === 2;
       }
+      const { pending, skipped, merged } = await prepareUploadPlan(
+        entries,
+        keepBoth,
+        (key) => availableCopyKey(bucket, key),
+      );
       for (const entry of pending)
         uploadFile(
           bucket,
@@ -581,7 +575,13 @@ async function queuePaths(bucket, prefix, paths) {
       const count = pending.filter((entry) => !entry.directory).length;
       log("Queued " + count + " file(s) for " + bucket + "/" + prefix);
       log("Skipped " + skipped + " unchanged item(s)");
-      return { files: count, skipped };
+      if (merged)
+        log(
+          "Merged " +
+            merged +
+            " repeated input path(s), using the last selected source.",
+        );
+      return { files: count, skipped, merged };
     },
   );
 }
@@ -802,7 +802,6 @@ async function runBackup(id, interactive = false) {
     throw new Error(
       "This backup belongs to another connection. Reconnect its original B2 key.",
     );
-  assertNoFileOperation();
   if (jobs.some((job) => job.running))
     throw new Error("Wait for the current folder sync to finish.");
   j.running = true;
@@ -811,6 +810,11 @@ async function runBackup(id, interactive = false) {
   let count = 0,
     skipped = 0;
   try {
+    const source = await fsp.lstat(j.folder);
+    if (!source.isDirectory() || source.isSymbolicLink())
+      throw new Error(
+        "The linked local folder was replaced. Choose the folder again before syncing.",
+      );
     persist();
     emit();
     const entries = [];
@@ -1016,6 +1020,8 @@ const handlers = {
       }
       const sdk = getClient();
       const buckets = await connectionBuckets();
+      if (connectionId() !== identity)
+        throw new Error("Connection changed during billing scan.");
       billingProgress = { completed: 0, total: buckets.length };
       emit();
       try {
@@ -1030,12 +1036,14 @@ const handlers = {
             }
           },
         );
+        if (connectionId() !== identity)
+          throw new Error("Connection changed during billing scan.");
         value.stale = revision !== scanRevision;
         if (connectionId() === identity && !value.stale)
           billingCache = { identity, revision: scanRevision, value };
         return value;
       } finally {
-        if (connectionId() === identity) {
+        if (billingPending === pending) {
           billingProgress = null;
           emit();
         }
@@ -1257,6 +1265,7 @@ const handlers = {
     historyPage(getClient(), bucket, prefix, marker),
   purgeFile: async (_, bucket, key) => {
     assertNoFileOperation();
+    const identity = connectionId();
     blockBusyDelete(bucket, key);
     const entries = await exactVersions(getClient(), bucket, key);
     if (!entries.length) {
@@ -1276,17 +1285,20 @@ const handlers = {
       defaultId: 0,
     });
     if (answer.response !== 1) return false;
-    assertNoFileOperation();
-    blockBusyDelete(bucket, key);
-    try {
-      const deleted = await purgeVersions(getClient(), bucket, key, entries);
-      cloudChanged();
-      log("Permanently deleted all versions: " + key);
-      return { deleted };
-    } catch (error) {
-      cloudChanged();
-      throw deleteError(error);
-    }
+    return withFileOperation("Deleting stored versions", async () => {
+      if (connectionId() !== identity)
+        throw new Error("Connection changed. Review this operation again.");
+      blockBusyDelete(bucket, key);
+      try {
+        const deleted = await purgeVersions(getClient(), bucket, key, entries);
+        cloudChanged();
+        log("Permanently deleted all versions: " + key);
+        return { deleted };
+      } catch (error) {
+        cloudChanged();
+        throw deleteError(error);
+      }
+    });
   },
 
   setTheme: (_, theme) => {
@@ -1546,6 +1558,7 @@ const handlers = {
   },
   remove: async (_, bucket, key) => {
     assertNoFileOperation();
+    const identity = connectionId();
     blockBusyDelete(bucket, key);
     const result = await dialog.showMessageBox(win, {
       type: "warning",
@@ -1557,24 +1570,32 @@ const handlers = {
       defaultId: 0,
       cancelId: 0,
     });
-    if (result.response === 2) return handlers.purgeFile(null, bucket, key);
+    if (result.response === 2) {
+      if (connectionId() !== identity)
+        throw new Error("Connection changed. Review this operation again.");
+      return handlers.purgeFile(null, bucket, key);
+    }
     if (result.response !== 1) return false;
-    assertNoFileOperation();
-    blockBusyDelete(bucket, key);
-    await deleteKey(bucket, key);
-    const remaining = await getClient().send(
-      new ListObjectsV2Command({ Bucket: bucket, Prefix: key, MaxKeys: 1 }),
-    );
-    if (remaining.Contents?.some((f) => f.Key === key))
-      throw new Error(
-        "Backblaze has not confirmed deletion yet. Refresh and try again.",
+    return withFileOperation("Deleting cloud file", async () => {
+      if (connectionId() !== identity)
+        throw new Error("Connection changed. Review this operation again.");
+      blockBusyDelete(bucket, key);
+      await deleteKey(bucket, key);
+      const remaining = await getClient().send(
+        new ListObjectsV2Command({ Bucket: bucket, Prefix: key, MaxKeys: 1 }),
       );
-    cloudChanged();
-    log("Deleted: " + key);
-    return true;
+      if (remaining.Contents?.some((f) => f.Key === key))
+        throw new Error(
+          "Backblaze has not confirmed deletion yet. Refresh and try again.",
+        );
+      cloudChanged();
+      log("Deleted: " + key);
+      return true;
+    });
   },
   removeFolder: async (_, bucket, prefix) => {
     assertNoFileOperation();
+    const identity = connectionId();
     if (!prefix || !prefix.endsWith("/"))
       throw new Error("Choose a non-root folder to delete.");
     blockBusyDelete(bucket, prefix, true);
@@ -1592,30 +1613,37 @@ const handlers = {
       defaultId: 0,
     });
     if (answer.response !== 1) return false;
-    assertNoFileOperation();
-    blockBusyDelete(bucket, prefix, true);
-    let removed = 0;
-    try {
-      for (const object of objects) {
-        await deleteKey(bucket, object.Key);
-        removed++;
+    return withFileOperation("Deleting cloud folder", async () => {
+      if (connectionId() !== identity)
+        throw new Error("Connection changed. Review this operation again.");
+      blockBusyDelete(bucket, prefix, true);
+      let removed = 0;
+      try {
+        for (const object of objects) {
+          await deleteKey(bucket, object.Key);
+          removed++;
+        }
+      } catch (error) {
+        cloudChanged();
+        throw new Error(
+          removed + " objects deleted before the error: " + error.message,
+        );
       }
-    } catch (error) {
       cloudChanged();
-      throw new Error(
-        removed + " objects deleted before the error: " + error.message,
+      const remaining = await getClient().send(
+        new ListObjectsV2Command({
+          Bucket: bucket,
+          Prefix: prefix,
+          MaxKeys: 1,
+        }),
       );
-    }
-    cloudChanged();
-    const remaining = await getClient().send(
-      new ListObjectsV2Command({ Bucket: bucket, Prefix: prefix, MaxKeys: 1 }),
-    );
-    if (remaining.Contents?.length)
-      throw new Error(
-        "Some files remain in this cloud folder. Another upload or retention rule may be preventing complete deletion.",
-      );
-    log("Deleted folder: " + prefix);
-    return { deleted: removed };
+      if (remaining.Contents?.length)
+        throw new Error(
+          "Some files remain in this cloud folder. Another upload or retention rule may be preventing complete deletion.",
+        );
+      log("Deleted folder: " + prefix);
+      return { deleted: removed };
+    });
   },
   versions: async (_, bucket, key, marker) => {
     const r = await getClient().send(
@@ -1650,6 +1678,8 @@ const handlers = {
   },
   restore: async (_, bucket, key, version) => {
     assertNoFileOperation();
+    const identity = connectionId();
+    blockBusyDelete(bucket, key);
     const head = await getClient().send(
       new HeadObjectCommand({ Bucket: bucket, Key: key, VersionId: version }),
     );
@@ -1664,17 +1694,21 @@ const handlers = {
       cancelId: 0,
     });
     if (r.response !== 1) return false;
-    assertNoFileOperation();
-    await getClient().send(
-      new CopyObjectCommand({
-        Bucket: bucket,
-        Key: key,
-        CopySource: copySource(bucket, key, version),
-      }),
-    );
-    cloudChanged();
-    log("Restored version: " + key);
-    return true;
+    return withFileOperation("Restoring stored version", async () => {
+      if (connectionId() !== identity)
+        throw new Error("Connection changed. Review this operation again.");
+      blockBusyDelete(bucket, key);
+      await getClient().send(
+        new CopyObjectCommand({
+          Bucket: bucket,
+          Key: key,
+          CopySource: copySource(bucket, key, version),
+        }),
+      );
+      cloudChanged();
+      log("Restored version: " + key);
+      return true;
+    });
   },
   share: async (_, bucket, key) => {
     const url = await getSignedUrl(
@@ -1686,23 +1720,24 @@ const handlers = {
     return "Private download link copied. It expires in 1 hour; anyone with the link can download.";
   },
   mkdir: async (_, bucket, prefix, name) => {
-    assertNoFileOperation();
-    name = typeof name === "string" ? name.trim() : "";
-    if (
-      !name?.trim() ||
-      /[\\/\x00-\x1f]/.test(name) ||
-      name === "." ||
-      name === ".."
-    )
-      throw new Error("Enter a folder name without slashes.");
-    await getClient().send(
-      new PutObjectCommand({
-        Bucket: bucket,
-        Key: joinKey(prefix, name.trim()) + "/",
-        Body: "",
-      }),
-    );
-    cloudChanged();
+    return withFileOperation("Creating cloud folder", async () => {
+      name = typeof name === "string" ? name.trim() : "";
+      if (
+        !name?.trim() ||
+        /[\\/\x00-\x1f]/.test(name) ||
+        name === "." ||
+        name === ".."
+      )
+        throw new Error("Enter a folder name without slashes.");
+      await getClient().send(
+        new PutObjectCommand({
+          Bucket: bucket,
+          Key: joinKey(prefix, name.trim()) + "/",
+          Body: "",
+        }),
+      );
+      cloudChanged();
+    });
   },
   installFinderSync: async () => {
     if (process.platform !== "darwin")
