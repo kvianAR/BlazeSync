@@ -67,3 +67,10 @@ test("deletion permission errors explain capabilities and retention", () => {
   const network = new Error("offline");
   assert.equal(deleteError(network), network);
 });
+
+test("delete preserves a diagnosed account cap instead of suggesting a permission change", () => {
+  const error = new Error("Backblaze account cap reached");
+  error.name = "BackblazeCapExceeded";
+  error.$metadata = { httpStatusCode: 403 };
+  assert.equal(deleteError(error), error);
+});

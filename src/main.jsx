@@ -716,6 +716,15 @@ function App() {
               {toast}
             </div>
           )}
+          {state.cloudLimit && (
+            <div className="alert" role="alert">
+              <AlertCircle size={18} />
+              <span>{state.cloudLimit}</span>
+              <button onClick={() => act(() => api.openCaps())}>
+                Backblaze Caps & Alerts
+              </button>
+            </div>
+          )}
           {state.fileOperation && (
             <div className="info-strip" role="status">
               <LoaderCircle size={18} className="spin" />

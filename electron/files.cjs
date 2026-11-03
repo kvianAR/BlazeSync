@@ -55,6 +55,7 @@ function updateProgress(t, loaded, now = Date.now()) {
   t.eta = t.speed > 0 ? Math.max(0, (t.size - loaded) / t.speed) : null;
 }
 function deleteError(error) {
+  if (error.name === "BackblazeCapExceeded") return error;
   if (error.name === "AccessDenied" || error.$metadata?.httpStatusCode === 403)
     return new Error(
       "Backblaze refused deletion. The key needs deleteFiles permission. Object Lock, retention or a legal hold may also block deletion.",

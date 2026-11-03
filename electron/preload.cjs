@@ -5,6 +5,7 @@ const methods = [
   "setBillingPaymentDay",
   "openBilling",
   "openPricing",
+  "openCaps",
   "openBackblaze",
   "moveSelection",
   "downloadSelection",

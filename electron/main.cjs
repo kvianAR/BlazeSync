@@ -44,6 +44,7 @@ const {
 } = require("./helpers.cjs");
 const { discoverConnection, healthFromError } = require("./connection.cjs");
 let health = "checking",
+  cloudLimit = null,
   checkingConnection = false,
   pendingSavedSecret = null;
 let win,
@@ -66,6 +67,11 @@ const {
 const { FolderMetrics } = require("./folder-metrics.cjs");
 const folderMetrics = new FolderMetrics();
 const { scanStorage } = require("./billing.cjs");
+const {
+  CAPS_URL,
+  isCloudLimit,
+  diagnoseCloudError,
+} = require("./cloud-errors.cjs");
 const { prepareUploadPlan } = require("./upload-plan.cjs");
 const {
   hashFile,
@@ -238,6 +244,7 @@ function publicState() {
     notificationsSupported: Notification.isSupported(),
     connectionId: connectionId(),
     health,
+    cloudLimit,
     revision,
     refreshSeconds: preferences.refreshSeconds ?? 15,
     connectionEditing,
@@ -311,21 +318,46 @@ function makeClient(c) {
     retryMode: "standard",
     maxAttempts: 5,
   });
+  return configureCloudClient(sdk);
+}
+function configureCloudClient(sdk) {
   sdk.middlewareStack.add(
-    (next) => async (args) => {
+    (next, context) => async (args) => {
       try {
         const result = await next(args);
-        if (client === sdk) setHealth("online");
-        return result;
-      } catch (error) {
         if (client === sdk) {
+          if (
+            cloudLimit &&
+            [200, 206].includes(result.response?.statusCode) &&
+            ["HeadObjectCommand", "GetObjectCommand"].includes(
+              context.commandName,
+            )
+          ) {
+            cloudLimit = null;
+            emit();
+          }
+          setHealth("online");
+        }
+        return result;
+      } catch (original) {
+        const error = await diagnoseCloudError(
+          sdk,
+          context.commandName,
+          args.input,
+          original,
+        );
+        if (client === sdk) {
+          if (isCloudLimit(error)) {
+            cloudLimit = error.message;
+            emit();
+          }
           const status = healthFromError(error);
           if (status) setHealth(status);
         }
         throw error;
       }
     },
-    { step: "initialize", name: "blazeConnectionHealth" },
+    { step: "initialize", name: "blazeConnectionHealth", override: true },
   );
   return sdk;
 }
@@ -992,6 +1024,7 @@ const handlers = {
     emit();
   },
   openBilling: () => shell.openExternal(BILLING_URL),
+  openCaps: () => shell.openExternal(CAPS_URL),
   openPricing: () =>
     shell.openExternal("https://www.backblaze.com/cloud-storage/pricing"),
   openBackblaze: () =>
@@ -1429,6 +1462,7 @@ const handlers = {
     pendingSavedSecret = null;
     client = next;
     health = "online";
+    cloudLimit = null;
     log("Connected to Backblaze B2");
     return { state: publicState(), buckets };
   },
@@ -1461,6 +1495,7 @@ const handlers = {
     pendingSavedSecret = null;
     client = null;
     connection = null;
+    cloudLimit = null;
     health = "checking";
     jobs = jobs.map((j) => ({ ...j, enabled: false }));
     persist();
@@ -1965,7 +2000,8 @@ app.whenReady().then(() => {
           },
           setTestConnection: (c, s3) => {
             connection = c;
-            client = s3;
+            client = configureCloudClient(s3);
+            cloudLimit = null;
             emit();
           },
           outputDir:

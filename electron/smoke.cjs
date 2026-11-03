@@ -134,6 +134,7 @@ module.exports = async function smoke(ctx) {
     },
   ];
   let denyDeletion = false;
+  let denyReadsForCap = false;
   let blockedVersions = false,
     releaseVersions = null;
   let blockedDelete = null,
@@ -163,6 +164,29 @@ module.exports = async function smoke(ctx) {
       let body = "",
         statusCode = 200,
         extra = {};
+      if (
+        denyReadsForCap &&
+        (req.method === "HEAD" ||
+          (req.method === "GET" &&
+            !q["list-type"] &&
+            !("versions" in q) &&
+            !("uploads" in q) &&
+            key))
+      ) {
+        return {
+          response: {
+            statusCode: 403,
+            headers: { "content-type": "application/xml" },
+            body: Readable.from([
+              Buffer.from(
+                req.method === "HEAD"
+                  ? ""
+                  : "<Error><Code>AccessDenied</Code><Message>Cannot download file, download bandwidth or transaction (Class B) cap exceeded.</Message></Error>",
+              ),
+            ]),
+          },
+        };
+      }
       if (req.method === "POST" && "uploads" in q) {
         const id = "multipart-" + ++multipartStarted;
         multipart.set(id, {
@@ -1241,6 +1265,29 @@ module.exports = async function smoke(ctx) {
   setTestConnection(connection, mock);
   checks.push(
     "account changes reject stale billing results and clear their progress indicator",
+  );
+  denyReadsForCap = true;
+  await runBackup(syncJob.id);
+  assert.match(syncJob.error, /Backblaze account cap reached/);
+  assert.match(getState().cloudLimit, /Caps & Alerts/);
+  assert.equal(getState().connected, true);
+  await nav("backups");
+  await waitFor(async () =>
+    (await inspect("document.body.innerText")).includes(
+      "Backblaze Caps & Alerts",
+    ),
+  );
+  await handlers.preview(null, "test-bucket", "Photos/sunset.JPG");
+  assert.match(getState().cloudLimit, /Caps & Alerts/);
+  denyReadsForCap = false;
+  await runBackup(syncJob.id);
+  assert.equal(syncJob.error, null);
+  assert.equal(getState().cloudLimit, null);
+  checks.push(
+    "opaque B2 cap errors expose a clear account-limit reason and Caps shortcut while preserving login",
+  );
+  checks.push(
+    "folder sync recovers after the account limit is lifted and clears the limit banner",
   );
   assert.equal(simulateLockedSave(), true);
   setTestConnection(connection, mock);

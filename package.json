@@ -1,6 +1,6 @@
 {
   "name": "blazesync",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "private": true,
   "description": "A desktop file manager compatible with Backblaze B2 Cloud Storage.",
   "main": "electron/main.cjs",
