@@ -47,6 +47,8 @@ BlazeSync brings B2 files, folders, transfers, version history and one-way backu
 
 The Storage & billing page uses Backblaze B2 Fundamentals public pricing, verified on November 3, 2026. The first 10 GB is free once per account. Storage above this allowance costs $6.95 per decimal TB per 30 days. At constant usage, 100 GB projects to $0.63 and 1 TB to $6.88 for 30 days.
 
+The billing page includes a **Pay on Backblaze** shortcut to the official billing portal. Choose your monthly payment day to receive a daily system notification from seven days before that date through the date itself, after 9 AM local time. Keep BlazeSync running in the menu bar and allow its macOS notifications. Days 29–31 use the final day of shorter months. Turn reminders off from the same page. Your chosen date is saved locally.
+
 The app projects storage charges at the current scanned amount. Actual invoices use byte-hours and may include egress, transactions, taxes or account-specific terms. Restricted keys and incomplete scans show visible-storage coverage and an estimate range. Refresh usage after external cloud changes. The rate is a dated published snapshot, with an official pricing link in the app.
 
 Moves and ordinary deletion can retain older B2 versions, which continue using storage. Review Versions & deleted before choosing an explicit permanent purge. Cloud moves copy and verify destinations before removing sources. Concurrent changes or failures can leave a partial move with verified destination copies preserved.

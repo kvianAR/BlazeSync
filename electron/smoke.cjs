@@ -815,6 +815,18 @@ module.exports = async function smoke(ctx) {
   );
   assert.equal(usage.estimate.monthlyUsd, 0);
   assert.equal(usage.pricing.usdPerTbPer30Days, 6.95);
+  await assert.rejects(
+    async () => handlers.setBillingPaymentDay(null, 32),
+    /monthly payment day/,
+  );
+  await handlers.setBillingPaymentDay(null, 31);
+  assert.equal(getState().billingPaymentDay, 31);
+  assert.ok(getState().paymentReminder.dueDate);
+  await handlers.setBillingPaymentDay(null, 0);
+  assert.equal(getState().paymentReminder, null);
+  checks.push(
+    "monthly payment date validates, persists and disables through IPC",
+  );
   await handlers.setBillingBudget(null, 5);
   assert.equal(getState().billingBudgetUsd, 5);
   await nav("billing");
@@ -824,6 +836,15 @@ module.exports = async function smoke(ctx) {
     ),
   );
   assert.ok((await inspect("document.body.innerText")).includes("$6.95"));
+  assert.ok(
+    (await inspect("document.body.innerText")).includes("Pay on Backblaze"),
+  );
+  assert.ok(
+    (await inspect("document.body.innerText")).includes("Monthly payment day"),
+  );
+  checks.push(
+    "billing page includes official payment shortcut and reminder settings",
+  );
   await fs.writeFile(
     path.join(outputDir, "BlazeSync-billing-dark.png"),
     (await win.webContents.capturePage()).toPNG(),

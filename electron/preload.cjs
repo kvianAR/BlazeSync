@@ -2,6 +2,8 @@ const { contextBridge, ipcRenderer, webUtils } = require("electron");
 const methods = [
   "billing",
   "setBillingBudget",
+  "setBillingPaymentDay",
+  "openBilling",
   "openPricing",
   "openBackblaze",
   "moveSelection",

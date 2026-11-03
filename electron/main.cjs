@@ -12,6 +12,7 @@ const {
   powerMonitor,
   shell,
   nativeTheme,
+  Notification,
 } = require("electron");
 const fs = require("node:fs");
 const fsp = fs.promises;
@@ -65,6 +66,11 @@ const {
 const { FolderMetrics } = require("./folder-metrics.cjs");
 const folderMetrics = new FolderMetrics();
 const { scanStorage } = require("./billing.cjs");
+const {
+  BILLING_URL,
+  validatePaymentDay,
+  paymentReminder,
+} = require("./payment-reminder.cjs");
 const {
   normalizeSelection,
   selectedObjects,
@@ -181,12 +187,46 @@ function persist(savedConnection = connection) {
   );
   fs.renameSync(temporary, statePath());
 }
+function checkPaymentReminder() {
+  if (smoke || isQuitting || !Notification.isSupported()) return;
+  const reminder = paymentReminder(
+    preferences.billingPaymentDay || 0,
+    new Date(),
+    preferences.lastPaymentNotification,
+  );
+  if (!reminder?.ready) return;
+  const notification = new Notification({
+    title: "BlazeSync · Backblaze payment reminder",
+    body:
+      reminder.daysRemaining === 0
+        ? "Your chosen monthly payment date is today. Open Backblaze billing to review your balance."
+        : `Your chosen monthly payment date is in ${reminder.daysRemaining} day${reminder.daysRemaining === 1 ? "" : "s"}. Open Backblaze billing to review your balance.`,
+  });
+  notification.on("click", () => shell.openExternal(BILLING_URL));
+  notification.on("failed", () => {
+    if (preferences.lastPaymentNotification === reminder.notificationKey) {
+      preferences.lastPaymentNotification = null;
+      savePreferences();
+    }
+  });
+  preferences.lastPaymentNotification = reminder.notificationKey;
+  savePreferences();
+  try {
+    notification.show();
+  } catch {
+    preferences.lastPaymentNotification = null;
+    savePreferences();
+  }
+}
 function publicState() {
   return {
     connected: !!client,
     fileOperation,
     billingProgress,
     billingBudgetUsd: preferences.billingBudgetUsd || 0,
+    billingPaymentDay: preferences.billingPaymentDay || 0,
+    paymentReminder: paymentReminder(preferences.billingPaymentDay || 0),
+    notificationsSupported: Notification.isSupported(),
     connectionId: connectionId(),
     health,
     revision,
@@ -727,6 +767,13 @@ const handlers = {
     savePreferences();
     emit();
   },
+  setBillingPaymentDay: (_, day) => {
+    preferences.billingPaymentDay = validatePaymentDay(day);
+    savePreferences();
+    checkPaymentReminder();
+    emit();
+  },
+  openBilling: () => shell.openExternal(BILLING_URL),
   openPricing: () =>
     shell.openExternal("https://www.backblaze.com/cloud-storage/pricing"),
   openBackblaze: () =>
@@ -1143,7 +1190,11 @@ const handlers = {
         new ListObjectsV2Command({ Bucket: buckets[0].Name, MaxKeys: 1 }),
       );
     assertNoFileOperation();
-    if (active.size || jobs.some((job) => job.running) || transfers.some((transfer) => transfer.status === "queued"))
+    if (
+      active.size ||
+      jobs.some((job) => job.running) ||
+      transfers.some((transfer) => transfer.status === "queued")
+    )
       throw new Error("Wait for active transfers and backups to finish.");
     persist(c);
     connectionEditing = false;
@@ -1173,7 +1224,11 @@ const handlers = {
     });
     if (answer.response !== 1) return false;
     assertNoFileOperation();
-    if (active.size || jobs.some((job) => job.running) || transfers.some((transfer) => transfer.status === "queued"))
+    if (
+      active.size ||
+      jobs.some((job) => job.running) ||
+      transfers.some((transfer) => transfer.status === "queued")
+    )
       throw new Error("Finish or cancel transfers before disconnecting.");
     connectionEditing = false;
     persist(null);
@@ -1518,6 +1573,12 @@ app.whenReady().then(() => {
     preferences.theme = "dark";
   if (![0, 15, 30, 60].includes(preferences.refreshSeconds))
     preferences.refreshSeconds = 15;
+  if (
+    !Number.isInteger(preferences.billingPaymentDay) ||
+    preferences.billingPaymentDay < 0 ||
+    preferences.billingPaymentDay > 31
+  )
+    preferences.billingPaymentDay = 0;
   nativeTheme.themeSource = preferences.theme;
   nativeTheme.on("updated", emit);
   setInterval(() => {
@@ -1639,6 +1700,10 @@ app.whenReady().then(() => {
       }
     });
   if (!smoke) {
+    checkPaymentReminder();
+    setInterval(checkPaymentReminder, 60000);
+    powerMonitor.on("resume", checkPaymentReminder);
+    powerMonitor.on("unlock-screen", checkPaymentReminder);
     checkConnection();
     setInterval(checkConnection, 30000);
     powerMonitor.on("resume", checkConnection);

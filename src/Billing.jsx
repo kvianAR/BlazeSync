@@ -33,6 +33,10 @@ export default function Billing({ api, state }) {
   const [error, setError] = useState("");
   const [budget, setBudget] = useState(String(state.billingBudgetUsd || ""));
   const [saved, setSaved] = useState(false);
+  const [paymentDay, setPaymentDay] = useState(
+    String(state.billingPaymentDay || ""),
+  );
+  const [reminderSaved, setReminderSaved] = useState(false);
   const request = useRef(0);
   const scannedRevision = useRef(state.revision);
   async function refresh(force = false) {
@@ -61,6 +65,9 @@ export default function Billing({ api, state }) {
   useEffect(() => {
     setBudget(String(state.billingBudgetUsd || ""));
   }, [state.billingBudgetUsd, state.connectionId]);
+  useEffect(() => {
+    setPaymentDay(String(state.billingPaymentDay || ""));
+  }, [state.billingPaymentDay]);
   const estimate = data?.estimate;
   const exceeded =
     state.billingBudgetUsd > 0 && estimate?.monthlyUsd > state.billingBudgetUsd;
@@ -81,6 +88,83 @@ export default function Billing({ api, state }) {
           Refresh usage
         </button>
       </div>
+      <section className="card">
+        <h2>Payment & monthly reminders</h2>
+        <p>
+          Open your Backblaze billing account to review invoices, payment
+          methods and any amount due.
+        </p>
+        <button
+          className="primary"
+          onClick={() =>
+            api.openBilling().catch((failure) => setError(failure.message))
+          }
+        >
+          <ExternalLink size={17} /> Pay on Backblaze
+        </button>
+        <form
+          onSubmit={async (event) => {
+            event.preventDefault();
+            try {
+              await api.setBillingPaymentDay(Number(paymentDay || 0));
+              setReminderSaved(true);
+            } catch (failure) {
+              setError(failure.message);
+            }
+          }}
+        >
+          <label>
+            Monthly payment day
+            <input
+              type="number"
+              min="1"
+              max="31"
+              step="1"
+              placeholder="Choose day 1–31"
+              value={paymentDay}
+              onChange={(event) => {
+                setPaymentDay(event.target.value);
+                setReminderSaved(false);
+              }}
+            />
+          </label>
+          <div className="form-actions">
+            <button type="submit">Save reminder date</button>
+            <button
+              type="button"
+              onClick={() =>
+                api
+                  .setBillingPaymentDay(0)
+                  .then(() => setReminderSaved(true))
+                  .catch((failure) => setError(failure.message))
+              }
+            >
+              Turn off reminders
+            </button>
+          </div>
+          {reminderSaved && (
+            <small role="status">Reminder settings saved on this Mac.</small>
+          )}
+        </form>
+        {state.paymentReminder && (
+          <p>
+            Next payment date · {state.paymentReminder.dueDate} ·{" "}
+            {state.paymentReminder.daysRemaining} days away.
+          </p>
+        )}
+        <p>
+          Daily notifications start 7 days before your chosen date and continue
+          through that date, from 9 AM local time. Keep BlazeSync running in the
+          menu bar and allow its macOS notifications. After sleep, the next
+          check shows today's reminder. Days 29–31 use the last day of shorter
+          months.
+        </p>
+        {state.notificationsSupported === false && (
+          <p role="alert">
+            System notifications are unavailable on this device.
+          </p>
+        )}
+      </section>
       {!state.connected && (
         <section className="card">
           <p>
